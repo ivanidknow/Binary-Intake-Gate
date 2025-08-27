@@ -1,0 +1,78 @@
+version: 2
+
+profiles:
+  dev:
+    thresholds: { deny: 80, warn: 40 }
+  staging:
+    thresholds: { deny: 80, warn: 40 }
+  prod:
+    thresholds: { deny: 80, warn: 40 }
+
+# Правила используют "CEL-subset":
+#  - true/false/null, && || !, in/not in, сравнения
+#  - доступ к данным: pe.signature.present, vt.detections.stats.malicious, elf.hardening.pie и т.п.
+#  - ярлыки: yara_families (список строк), capa_tactics (список строк)
+rules:
+  # --- AV / Reputation
+  - id: kes-malicious
+    when: kes and kes.verdict == "malicious"
+    then: deny
+    reason: "Local AV marked binary as malicious"
+
+  - id: vt-high-mal
+    when: vt and vt.detections and vt.detections.stats.malicious >= 5
+    then: deny
+    reason: "VT malicious detections ≥ 5"
+
+  - id: vt-threat
+    when: vt and vt.detections and vt.detections.threat_label != null
+    score: 60
+    reason: "VT suggested threat label present"
+
+  # --- Packers / Signatures
+  - id: packer-unsigned
+    when: (pe and pe.signature and pe.signature.present == false) and ("packers" in yara_families)
+    score: 50
+    reason: "Packed and unsigned binary"
+
+  # --- PE/ELF Hardening
+  - id: pe-rwx
+    when: pe and pe.sections and pe.sections.has_rwx == true
+    score: 80
+    reason: "PE has RWX section(s)"
+
+  - id: elf-weak
+    when: elf and ((elf.hardening.pie == false) or (elf.hardening.nx == false))
+    score: 40
+    reason: "ELF hardening weak (PIE/NX)"
+
+  - id: pe-no-cfg
+    when: pe and pe.hardening and pe.hardening.cfg == false
+    score: 30
+    reason: "PE: CFG disabled"
+
+  # --- capa tactics
+  - id: capa-defense-evasion
+    when: "'defense-evasion' in capa_tactics"
+    score: 60
+    reason: "capa tactic: defense-evasion"
+
+  - id: capa-credential-access
+    when: "'credential-access' in capa_tactics"
+    score: 60
+    reason: "capa tactic: credential-access"
+
+  - id: cve-critical
+    when: cve and cve.summary and cve.summary.critical > 0
+    then: deny
+    reason: "Known critical CVEs in dependencies"
+
+  - id: cve-high
+    when: cve and cve.summary and cve.summary.high > 0
+    score: 60
+    reason: "High-severity CVEs in dependencies"
+    
+  - id: cve-medium-prod
+    when: cve and cve.summary and cve.summary.medium > 0 and meta and meta.profile == "prod"
+    score: 50
+    reason: "Medium CVEs present (prod profile)"

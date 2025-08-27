@@ -1,0 +1,21 @@
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binary-intake-gate"
+version = "0.0.3"
+description = "Binary Intake Gate — Stage 0.1b scaffold (Windows install fix)"
+authors = [{name="Your Name"}]
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+bin-gate = "bin_gate.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

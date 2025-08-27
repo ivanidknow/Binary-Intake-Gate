@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.pytest_cache/
+.coverage
+
+# Project artifacts
+cache/*.sqlite
+artifacts/
+report.md
+human_report.md
+playwright/.cache/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
