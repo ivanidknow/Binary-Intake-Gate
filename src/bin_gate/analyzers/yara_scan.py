@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 import os, sys, hashlib, json, time
 
 # ======== РАЗУМНЫЕ ДЕФОЛТЫ (можно переопределять флагами/ENV) ========
@@ -10,6 +10,69 @@ DEFAULT_MAX_HITS    = int(os.getenv("YARA_MAX_HITS", "80"))
 DEFAULT_FAST_MODE   = bool(int(os.getenv("YARA_FAST", "1")))     # 1=fast (останавливает правило на первом совпадении)
 DEFAULT_USE_BUILTIN = bool(int(os.getenv("YARA_USE_BUILTIN", "1")))
 CACHE_DIR_ENV       = os.getenv("YARA_CACHE_DIR")                # куда складывать .yarac
+
+# ======== МАППИНГ ТЕХНИК ATT&CK ИЗ YARA МЕТАДАННЫХ ========
+# Ключевые слова для извлечения техник из имён правил и meta полей
+TECHNIQUE_KEYWORDS = {
+    # Persistence
+    "persistence": "persistence",
+    "startup": "persistence",
+    "autorun": "persistence",
+    "service": "persistence",
+    "scheduled": "persistence",
+    "registry_run": "persistence",
+    # Defense Evasion
+    "evasion": "defense-evasion",
+    "injection": "defense-evasion",
+    "obfuscat": "defense-evasion",
+    "packer": "defense-evasion",
+    "anti_debug": "defense-evasion",
+    "anti_vm": "defense-evasion",
+    "anti_analysis": "defense-evasion",
+    "hollowing": "defense-evasion",
+    # Credential Access
+    "credential": "credential-access",
+    "mimikatz": "credential-access",
+    "password": "credential-access",
+    "keylog": "credential-access",
+    "dump_lsass": "credential-access",
+    # Discovery
+    "discovery": "discovery",
+    "enum": "discovery",
+    "recon": "discovery",
+    "systeminfo": "discovery",
+    # Lateral Movement
+    "lateral": "lateral-movement",
+    "psexec": "lateral-movement",
+    "wmi_exec": "lateral-movement",
+    "rdp": "lateral-movement",
+    # Command and Control
+    "c2": "command-and-control",
+    "beacon": "command-and-control",
+    "cobalt": "command-and-control",
+    "backdoor": "command-and-control",
+    "rat": "command-and-control",
+    "reverse_shell": "command-and-control",
+    # Exfiltration
+    "exfil": "exfiltration",
+    "data_theft": "exfiltration",
+    "upload": "exfiltration",
+    # Collection
+    "collection": "collection",
+    "screen_capture": "collection",
+    "clipboard": "collection",
+    "keylogger": "collection",
+    # Execution
+    "execution": "execution",
+    "shellcode": "execution",
+    "powershell": "execution",
+    "script": "execution",
+    # Impact
+    "ransomware": "impact",
+    "wiper": "impact",
+    "encrypt": "impact",
+    "destruct": "impact",
+}
 
 # ======== ВСТРОЕННЫЕ «БЕЗОПАСНЫЕ» ПРАВИЛА (минимум FP) ========
 # Строгие гейты по магии/структуре (модуль pe обязателен)
@@ -214,6 +277,90 @@ def _too_big(path: Path, max_mb: int) -> bool:
     except Exception:
         return False
 
+
+def _extract_techniques_from_match(rule_name: str, meta: Dict[str, Any], tags: List[str]) -> Set[str]:
+    """
+    Извлекает техники ATT&CK из YARA match метаданных.
+    Поддерживает поля: meta.technique, meta.attack, meta.mitre, meta.tactic, meta.os
+    А также keyword-based detection из имени правила и тегов.
+    """
+    techniques: Set[str] = set()
+
+    # 1. Прямые поля техник в meta
+    for field in ("technique", "techniques", "attack", "mitre", "mitre_attack", "att&ck", "attck"):
+        val = meta.get(field)
+        if val:
+            if isinstance(val, str):
+                # Может быть "T1055, T1059" или "defense-evasion"
+                for part in val.replace(",", " ").split():
+                    part = part.strip().lower()
+                    if part:
+                        techniques.add(part)
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        techniques.add(item.strip().lower())
+                    elif isinstance(item, dict):
+                        # CAPE/YARA-CTI format: {"tactic": "...", "technique": "..."}
+                        tactic = (item.get("tactic") or "").strip().lower()
+                        tech = (item.get("technique") or item.get("id") or "").strip()
+                        if tactic:
+                            techniques.add(tactic.replace(" ", "-"))
+                        if tech:
+                            techniques.add(tech.upper())
+
+    # 2. Поле tactic напрямую
+    tactic = meta.get("tactic") or meta.get("tactics")
+    if tactic:
+        if isinstance(tactic, str):
+            techniques.add(tactic.strip().lower().replace(" ", "-"))
+        elif isinstance(tactic, list):
+            for t in tactic:
+                if isinstance(t, str):
+                    techniques.add(t.strip().lower().replace(" ", "-"))
+
+    # 3. Поле capability (CAPE rules)
+    capability = meta.get("capability") or meta.get("capabilities")
+    if capability:
+        if isinstance(capability, str):
+            techniques.add(f"capability:{capability.strip().lower()}")
+        elif isinstance(capability, list):
+            for c in capability:
+                if isinstance(c, str):
+                    techniques.add(f"capability:{c.strip().lower()}")
+
+    # 4. Keyword-based detection из имени правила
+    rule_lower = rule_name.lower()
+    for keyword, technique in TECHNIQUE_KEYWORDS.items():
+        if keyword in rule_lower:
+            techniques.add(technique)
+
+    # 5. Из тегов
+    for tag in tags:
+        tag_lower = tag.lower()
+        for keyword, technique in TECHNIQUE_KEYWORDS.items():
+            if keyword in tag_lower:
+                techniques.add(technique)
+        # Прямые теги-тактики
+        if tag_lower in ("persistence", "evasion", "execution", "collection", "exfiltration", "impact"):
+            techniques.add(tag_lower)
+
+    # 6. Family-based inference
+    family = (meta.get("family") or "").lower()
+    if "packer" in family or family == "packers":
+        techniques.add("defense-evasion")
+    if "ransomware" in family:
+        techniques.add("impact")
+    if "stealer" in family or "infostealer" in family:
+        techniques.add("credential-access")
+        techniques.add("collection")
+    if "rat" in family or "backdoor" in family:
+        techniques.add("command-and-control")
+    if "miner" in family or "cryptominer" in family:
+        techniques.add("impact")
+
+    return techniques
+
 # ======== ПУБЛИЧНОЕ API ========
 def run_yara(
     path: Path,
@@ -273,12 +420,16 @@ def run_yara(
     for m in matches:
         meta = dict(m.meta) if hasattr(m, "meta") else {}
         sev = _norm_severity(meta)
+        tags = list(getattr(m, "tags", []) or [])
+        # Извлекаем техники ATT&CK из метаданных
+        techniques = _extract_techniques_from_match(m.rule, meta, tags)
         out.append({
             "rule": m.rule,
             "namespace": m.namespace,
             "meta": meta,
             "severity": sev,
-            "tags": list(getattr(m, "tags", []) or []),
+            "tags": tags,
+            "techniques": sorted(techniques),  # ATT&CK techniques extracted
         })
 
     sev_order = {"critical": 3, "high": 2, "medium": 1, "low": 0}
@@ -287,3 +438,25 @@ def run_yara(
         out = out[:max_hits]
         out.append({"rule": "yara_truncated", "namespace": "meta", "meta": {"max_hits": max_hits}})
     return out
+
+
+def extract_all_techniques(yara_hits: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    """
+    Агрегирует все техники и rule_hits из YARA результатов.
+    Возвращает (techniques, rule_hits) для заполнения Evidence.capa.
+    """
+    all_techniques: Set[str] = set()
+    rule_hits: List[str] = []
+
+    for hit in yara_hits:
+        if hit.get("namespace") == "errors":
+            continue
+        rule_name = hit.get("rule", "")
+        if rule_name:
+            rule_hits.append(f"YARA:{rule_name}")
+        techniques = hit.get("techniques") or []
+        for t in techniques:
+            if t:
+                all_techniques.add(t)
+
+    return sorted(all_techniques), rule_hits[:50]

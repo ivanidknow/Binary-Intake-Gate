@@ -1,11 +1,18 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Set, Optional
 import os, json, shutil, subprocess
 
-# По умолчанию таймаут 60с, лимит размера выключен (0 = нет лимита)
-DEFAULT_TIMEOUT_SEC = int(os.getenv("CAPA_TIMEOUT_SEC", "120"))
+# ======== ФЛАГ ГЛУБОКОГО АНАЛИЗА CAPA ========
+# По умолчанию False — используем быстрые методы (YARA + DIE).
+# Включается флагом --deep-capa или ENABLE_DEEP_CAPA=1
+ENABLE_DEEP_CAPA = bool(int(os.getenv("ENABLE_DEEP_CAPA", "0")))
+
+# Жёсткий таймаут 45с для устранения зависаний; лимит размера выключен (0 = нет лимита)
+DEFAULT_TIMEOUT_SEC = int(os.getenv("CAPA_TIMEOUT_SEC", "45"))
 DEFAULT_MAX_MB      = int(os.getenv("CAPA_MAX_MB", "0"))
+# Ограничение набора правил для ускорения (критичные тактики)
+CAPA_SCOPE_TAGS = os.getenv("CAPA_SCOPE_TAGS", "anti-analysis,impact")
 
 # Грубый маппинг названий правил в тактики ATT&CK (ярлыки для отчёта)
 KEYWORDS_TO_TACTICS = {
@@ -56,12 +63,46 @@ def _extract_tactics_from_rule(rule: dict) -> List[str]:
             tactics.add(v)
     return sorted(tactics)
 
-def run_capa(path: Path, timeout_sec: int = DEFAULT_TIMEOUT_SEC, max_mb: int = DEFAULT_MAX_MB, rules_dir: str | None = None) -> Dict[str, Any]:
+def run_capa(
+    path: Path,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    max_mb: int = DEFAULT_MAX_MB,
+    rules_dir: str | None = None,
+    *,
+    enable_deep: Optional[bool] = None,
+    prefilled_techniques: Optional[List[str]] = None,
+    prefilled_rule_hits: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
     Возвращает:
-      { "rule_hits":[...], "tactics":[...], "errors":[...] }
+      { "rule_hits":[...], "tactics":[...], "errors":[], "source": "capa"|"yara_die"|"skipped" }
+
+    Если enable_deep=False (по умолчанию), возвращает предсобранные данные из YARA/DIE.
+    Если enable_deep=True, выполняет реальный запуск capa.
     """
-    out: Dict[str, Any] = {"rule_hits": [], "tactics": [], "errors": []}
+    # Определяем режим работы
+    deep_mode = enable_deep if enable_deep is not None else ENABLE_DEEP_CAPA
+
+    out: Dict[str, Any] = {
+        "rule_hits": [],
+        "tactics": [],
+        "techniques": [],  # новое поле для совместимости
+        "errors": [],
+        "source": "skipped",
+    }
+
+    # Если глубокий анализ отключён — используем предсобранные данные
+    if not deep_mode:
+        if prefilled_techniques:
+            out["tactics"] = sorted(set(prefilled_techniques))
+            out["techniques"] = sorted(set(prefilled_techniques))
+        if prefilled_rule_hits:
+            out["rule_hits"] = prefilled_rule_hits[:50]
+        out["source"] = "yara_die"
+        return out
+
+    # --- Глубокий режим: запуск реального capa ---
+    out["source"] = "capa"
 
     if _too_big(path, max_mb):
         out["errors"].append(f"capa_skipped_large_file(size_mb>{max_mb})")
@@ -70,6 +111,13 @@ def run_capa(path: Path, timeout_sec: int = DEFAULT_TIMEOUT_SEC, max_mb: int = D
     exe = _which_capa()
     if not exe:
         out["errors"].append("capa_not_found")
+        # Fallback на YARA/DIE данные
+        if prefilled_techniques:
+            out["tactics"] = sorted(set(prefilled_techniques))
+            out["techniques"] = sorted(set(prefilled_techniques))
+        if prefilled_rule_hits:
+            out["rule_hits"] = prefilled_rule_hits[:50]
+        out["source"] = "yara_die_fallback"
         return out
 
     cmd = [exe, "-j", "--quiet"]
@@ -81,12 +129,26 @@ def run_capa(path: Path, timeout_sec: int = DEFAULT_TIMEOUT_SEC, max_mb: int = D
             cmd += ["-r", str(rp)]
         else:
             out["errors"].append(f"capa_rules_missing:{rules_dir}")
+    # Ограничение набора правил (anti-analysis, impact) — меньше времени на метаданные
+    if CAPA_SCOPE_TAGS:
+        for tag in CAPA_SCOPE_TAGS.split(","):
+            t = tag.strip()
+            if t:
+                cmd += ["-t", t]
 
     cmd.append(str(path))
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     except subprocess.TimeoutExpired:
         out["errors"].append(f"capa_timeout({timeout_sec}s)")
+        out["status"] = "timeout"
+        # При таймауте возвращаем YARA/DIE данные как fallback
+        if prefilled_techniques:
+            out["tactics"] = sorted(set(prefilled_techniques))
+            out["techniques"] = sorted(set(prefilled_techniques))
+        if prefilled_rule_hits:
+            out["rule_hits"] = prefilled_rule_hits[:50]
+        out["source"] = "yara_die_timeout_fallback"
         return out
     except Exception as e:
         out["errors"].append(f"capa_exec_error:{e}")
@@ -122,6 +184,58 @@ def run_capa(path: Path, timeout_sec: int = DEFAULT_TIMEOUT_SEC, max_mb: int = D
         for t in _extract_tactics_from_rule(r):
             tactics.add(t)
 
-    out["rule_hits"] = sorted(hits)[:25]
+    # Мержим с YARA/DIE данными
+    if prefilled_techniques:
+        for t in prefilled_techniques:
+            tactics.add(t)
+    if prefilled_rule_hits:
+        hits.extend(prefilled_rule_hits)
+
+    out["rule_hits"] = sorted(set(hits))[:50]
     out["tactics"] = sorted(tactics)
+    out["techniques"] = sorted(tactics)
     return out
+
+
+def get_techniques_from_yara_die(
+    yara_techniques: Optional[List[str]] = None,
+    yara_rule_hits: Optional[List[str]] = None,
+    die_findings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Собирает данные техник из YARA и DIE для быстрого заполнения Evidence.capa
+    без запуска capa.
+    """
+    techniques: Set[str] = set()
+    rule_hits: List[str] = []
+
+    if yara_techniques:
+        for t in yara_techniques:
+            techniques.add(t)
+
+    if yara_rule_hits:
+        rule_hits.extend(yara_rule_hits)
+
+    if die_findings:
+        for f in die_findings:
+            rule_hits.append(f"DIE:{f}")
+            # Мап DIE-детектов в техники
+            f_lower = f.lower()
+            if "packer" in f_lower or "protector" in f_lower:
+                techniques.add("defense-evasion")
+            if "crypto" in f_lower:
+                techniques.add("defense-evasion")
+            if "obfuscator" in f_lower:
+                techniques.add("defense-evasion")
+            if "inject" in f_lower:
+                techniques.add("defense-evasion")
+            if "compiler" in f_lower and "c++" in f_lower:
+                pass  # Не добавляем техники для обычных компиляторов
+
+    return {
+        "tactics": sorted(techniques),
+        "techniques": sorted(techniques),
+        "rule_hits": rule_hits[:50],
+        "source": "yara_die",
+        "errors": [],
+    }

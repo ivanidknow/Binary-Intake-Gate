@@ -2,6 +2,9 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
 import time
 import requests
+import json
+import urllib.request
+import urllib.error
 
 _OSV_QUERY = "https://api.osv.dev/v1/query"
 _OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
@@ -154,45 +157,83 @@ def query_osv_package(name: str, ecosystem: str, version: str, *, timeout_sec: i
         })
     return out, errs
 
-def query_osv_batch(pkgs: List[Tuple[str, str, str]], *, timeout_sec: int = 25) -> Tuple[List[List[Dict[str, Any]]], List[str]]:
+def _normalize_osv_vuln(v: dict) -> dict:
+    vid = v.get("id") or ""
+    # предпочитаем CVE из aliases
+    for a in v.get("aliases", []) or []:
+        if a.startswith("CVE-"):
+            vid = a
+            break
+    # лучший CVSS
+    best = None
+    for sev in v.get("severity", []) or []:
+        try:
+            if sev.get("type", "").upper().startswith("CVSS"):
+                score = float(sev.get("score", "0").split("/")[0])
+                best = max(best or 0.0, score)
+        except Exception:
+            pass
+    # маппинг severity
+    sev_label = None
+    if best is not None:
+        if best >= 9.0: sev_label = "CRITICAL"
+        elif best >= 7.0: sev_label = "HIGH"
+        elif best >= 4.0: sev_label = "MEDIUM"
+        else: sev_label = "LOW"
+    elif v.get("database_specific", {}).get("severity"):
+        sev_label = v["database_specific"]["severity"]
+
+    return {
+        "id": vid or v.get("id", ""),
+        "summary": v.get("summary", ""),
+        "severity": sev_label,
+        "cvss": best,
+        "affected": v.get("affected", []),
+        "references": v.get("references", []),
+    }
+
+def query_osv_batch(triples, timeout: int = 15):
     """
-    Batch-вариант: принимает список (name, ecosystem, version).
-    Возвращает (findings_per_item, errors), где findings_per_item — список списков findings,
-    выровненный по входному порядку.
+    triples: list[tuple[str, str, str]]  -> [(name, ecosystem, version), ...]
+    returns: (list[list[vuln]], list[str]errors)
     """
-    items = []
-    for (name, eco, ver) in pkgs:
-        items.append({"package": {"name": name, "ecosystem": eco}, "version": ver})
+    if not triples:
+        return [], []
 
-    doc, errs = _request_json(_OSV_QUERY_BATCH, {"queries": items}, timeout_sec=timeout_sec)
-    if doc is None:
-        return [[] for _ in pkgs], errs or ["osv_no_response"]
+    body = {
+        "queries": [
+            {"package": {"name": n, "ecosystem": e}, "version": v}
+            for (n, e, v) in triples
+        ]
+    }
+    req = urllib.request.Request(
+        "https://api.osv.dev/v1/querybatch",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "bin-gate/1.0 (+cve-batch)"
+        },
+        method="POST",
+    )
 
-    results = doc.get("results") or []
-    out_all: List[List[Dict[str, Any]]] = []
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as ex:
+        # мягко деградируем: пустые результаты на все запросы
+        return [[] for _ in triples], [f"osv_error:batch:http:{ex.code}"]
+    except Exception as ex:
+        return [[] for _ in triples], [f"osv_error:batch:{type(ex).__name__}"]
 
-    for res in results:
-        vulns = (res or {}).get("vulns") or []
-        bucket: List[Dict[str, Any]] = []
-        for v in vulns:
-            sev_list = v.get("severity") or []
-            db_sev = None
-            try:
-                db_sev = (v.get("database_specific") or {}).get("severity")
-            except Exception:
-                db_sev = None
-            score, label = _sev_from_scores(sev_list, db_sev)
-            bucket.append({
-                "id": _best_id(v),
-                "aliases": v.get("aliases") or [],
-                "summary": v.get("summary"),
-                "cvss": score,
-                "severity": label,
-            })
-        out_all.append(bucket)
+    results = []
+    for entry in data.get("results", []):
+        vulns = []
+        for v in entry.get("vulns", []) or []:
+            vulns.append(_normalize_osv_vuln(v))
+        results.append(vulns)
 
-    # Если OSV вернул меньше, чем запросили — добьём пустыми
-    while len(out_all) < len(pkgs):
-        out_all.append([])
+    # на случай, если OSV вернул меньше результатов, выровняем длину
+    if len(results) < len(triples):
+        results.extend([[] for _ in range(len(triples) - len(results))])
 
-    return out_all, errs
+    return results, []

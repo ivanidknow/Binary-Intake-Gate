@@ -1,102 +1,97 @@
+# vt_full.py
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional
-import requests, time
+import os, time, requests
 
 _API_BASE = "https://www.virustotal.com/api/v3"
-_last_ts: Optional[float] = None
 
-def _throttle(min_interval_sec: float) -> None:
+# Быстрый режим по умолчанию: берём только /files/{sha256}
+FAST_MODE = os.getenv("VT_FULL_FAST", "1") == "1"
+# Ультра-быстрый режим: отключает любой троттлинг внутри этого модуля
+ULTRA_FAST = os.getenv("VT_ULTRA_FAST", "0") == "1"
+
+DEFAULT_TIMEOUT = int(os.getenv("VT_TIMEOUT_SEC", "15"))
+DEFAULT_MIN_INTERVAL = float(os.getenv("VT_MIN_INTERVAL", "6.0"))
+MAX_ENGINES = int(os.getenv("VT_FULL_MAX_ENGINES", "20"))
+
+_last_ts: Optional[float] = None
+_min_interval: float = DEFAULT_MIN_INTERVAL
+
+def _throttle():
     global _last_ts
+    if ULTRA_FAST:
+        _last_ts = time.time()
+        return
     now = time.time()
-    if _last_ts is None: _last_ts = now; return
-    if now - _last_ts < min_interval_sec: time.sleep(min_interval_sec - (now - _last_ts))
+    if _last_ts is None:
+        _last_ts = now
+        return
+    delta = now - _last_ts
+    if delta < _min_interval:
+        time.sleep(_min_interval - delta)
     _last_ts = time.time()
 
 def _auth_hdr(api_key: Optional[str]) -> Dict[str, str]:
-    return {"x-apikey": api_key, "Authorization": f"Bearer {api_key}"} if api_key else {}
+    return {"x-apikey": api_key} if api_key else {}
 
-def vt_fetch_full_metrics(sha256: str,
-                          api_key: Optional[str],
-                          *,
-                          timeout_sec: int = 20,
-                          min_interval_sec: float = 15.0,
-                          max_results: int = 15) -> Tuple[Optional[Dict[str, Any]], list[str]]:
+def vt_fetch_full_metrics(
+    sha256: str,
+    api_key: Optional[str],
+    *,
+    timeout_sec: int = DEFAULT_TIMEOUT,
+    min_interval_sec: Optional[float] = None,
+    include_relationships: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Собирает то же, что твой vt.py: behaviours, detections (stats+subset engines),
-    relations (urls/domains/ips/files), comments — с лимитами, безопасно. Возвращает (dict, errors).
+    Ультра-быстрый сбор: один запрос /files/{sha256}, без behaviours/relations/comments.
+    Совместим по сигнатуре с прежним вызовом из cli.py.
     """
     errs: List[str] = []
-    if not api_key:
-        return None, ["vt_no_api_key"]
+    out: Dict[str, Any] = {
+        "sha256": sha256,
+        "permalink": f"https://www.virustotal.com/gui/file/{sha256}",
+        "detections": {},
+    }
 
-    out: Dict[str, Any] = {"sha256": sha256, "behaviours": [], "detections": {}, "relations": {}, "comments": []}
-
-    # --- behaviours
-    try:
-        _throttle(min_interval_sec)
-        r = requests.get(f"{_API_BASE}/files/{sha256}/behaviours", headers=_auth_hdr(api_key), timeout=timeout_sec)
-        if r.status_code == 200:
-            data = (r.json() or {}).get("data", []) or []
-            for entry in data[:5]:
-                attrs = entry.get("attributes", {}) or {}
-                # берём только summary и важные счетчики
-                out["behaviours"].append({
-                    "id": entry.get("id"),
-                    "summary": attrs.get("summary", {}),
-                })
-    except Exception as e:
-        errs.append(f"vt_behaviours_error:{e}")
-
-    # --- detections (stats + subset of engines)
-    try:
-        _throttle(min_interval_sec)
-        r = requests.get(f"{_API_BASE}/files/{sha256}", headers=_auth_hdr(api_key), timeout=timeout_sec)
-        if r.status_code == 200:
-            data = (r.json() or {}).get("data", {}) or {}
-            attrs = data.get("attributes", {}) or {}
-            out["detections"]["stats"] = attrs.get("last_analysis_stats", {})
-            results = attrs.get("last_analysis_results", {}) or {}
-            # до max_results движков
-            engines = []
-            for eng, res in list(results.items())[:max_results]:
-                engines.append({"engine": eng, "category": res.get("category"), "result": res.get("result")})
-            out["detections"]["engines"] = engines
-            out["detections"]["reputation"] = attrs.get("reputation")
-            out["detections"]["threat_label"] = (attrs.get("popular_threat_classification") or {}).get("suggested_threat_label")
-            out["permalink"] = f"https://www.virustotal.com/gui/file/{sha256}"
-    except Exception as e:
-        errs.append(f"vt_detections_error:{e}")
-
-    # --- relations (subset)
-    for rel in ["contacted_urls", "contacted_domains", "contacted_ips", "bundled_files"]:
+    # Если из CLI пришёл min_interval_sec — примем, но в ULTRA_FAST троттлинг всё равно отключён
+    global _min_interval
+    if min_interval_sec is not None:
         try:
-            _throttle(min_interval_sec)
-            r = requests.get(f"{_API_BASE}/files/{sha256}/relationships/{rel}", headers=_auth_hdr(api_key), timeout=timeout_sec)
-            if r.status_code == 200:
-                data = (r.json() or {}).get("data", []) or []
-                items: List[str] = []
-                for obj in data[:10]:
-                    attr = obj.get("attributes", {}) or {}
-                    if "url" in attr: items.append(attr.get("url"))
-                    elif "ip_address" in attr: items.append(attr.get("ip_address"))
-                    elif "host_name" in attr: items.append(attr.get("host_name"))
-                    elif "sha256" in attr: items.append(attr.get("sha256"))
-                out["relations"][rel] = items
-        except Exception as e:
-            errs.append(f"vt_rel_error:{rel}:{e}")
+            _min_interval = float(min_interval_sec)
+        except Exception:
+            _min_interval = DEFAULT_MIN_INTERVAL
 
-    # --- comments (subset)
     try:
-        _throttle(min_interval_sec)
-        r = requests.get(f"{_API_BASE}/files/{sha256}/comments", headers=_auth_hdr(api_key), timeout=timeout_sec)
-        if r.status_code == 200:
-            data = (r.json() or {}).get("data", []) or []
-            for entry in data[:5]:
-                attrs = entry.get("attributes", {}) or {}
-                author = (attrs.get("author", {}) or {}).get("id", "anon")
-                text = (attrs.get("text") or "").strip()
-                out["comments"].append({"author": author, "text": text[:200]})
+        _throttle()
+        r = requests.get(f"{_API_BASE}/files/{sha256}", headers=_auth_hdr(api_key), timeout=timeout_sec)
     except Exception as e:
-        errs.append(f"vt_comments_error:{e}")
+        return out, [f"vt_core_error:{e}"]
 
+    if r.status_code != 200:
+        return out, [f"vt_http_status:{r.status_code}"]
+
+    try:
+        data = (r.json() or {}).get("data", {}) or {}
+        attrs = data.get("attributes", {}) or {}
+        out["detections"]["stats"] = attrs.get("last_analysis_stats", {})
+        results = attrs.get("last_analysis_results", {}) or {}
+        engines = []
+        for eng, res in list(results.items())[:MAX_ENGINES]:
+            engines.append({
+                "engine": eng,
+                "category": res.get("category"),
+                "result": (res.get("result") or "")[:200],
+            })
+        out["detections"]["engines"] = engines
+        out["detections"]["reputation"] = attrs.get("reputation")
+        out["detections"]["threat_label"] = (attrs.get("popular_threat_classification") or {}).get("suggested_threat_label")
+        out["meaningful_name"] = attrs.get("meaningful_name") or (attrs.get("names") or [None])[0]
+        out["size"] = attrs.get("size")
+        out["type_extension"] = attrs.get("type_extension")
+        out["first_submission_date"] = attrs.get("first_submission_date")
+        out["last_submission_date"] = attrs.get("last_submission_date")
+    except Exception as e:
+        errs.append(f"vt_json_error:{e}")
+
+    # FAST_MODE всегда True — расширения не тянем
     return out, errs

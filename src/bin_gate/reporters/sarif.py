@@ -13,6 +13,21 @@ def _rel_uri(p: str) -> str:
     # SARIF хочет forward slashes
     return str(rel).replace("\\", "/")
 
+def _attach_container_properties(result: dict, ev: dict) -> None:
+    cont = (ev.get("meta") or {}).get("container") or {}
+    if not cont or cont.get("type") != "msi":
+        return
+    # Сохраняем в properties → видимо в SARIF-вьюверах как custom props
+    props = result.setdefault("properties", {})
+    props["container"] = {
+        "type": "msi",
+        "path": cont.get("path"),
+        "ProductName": cont.get("ProductName"),
+        "ProductVersion": cont.get("ProductVersion"),
+        "ProductCode": cont.get("ProductCode"),
+        "Manufacturer": cont.get("Manufacturer"),
+    }
+
 def _collect_rules(evidences: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     # Берём id и текст из Reasons: "[id] reason"
     rules: Dict[str, Dict[str, Any]] = {}
@@ -76,7 +91,7 @@ def write_sarif_report(out_path: Path, evidences: List[Dict[str, Any]], tool_nam
                         }
                     }]
                 })
-
+        _attach_container_properties(results[-1], ev)
     sarif = {
         "version": "2.1.0",
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",

@@ -1,21 +1,57 @@
-
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "binary-intake-gate"
-version = "0.0.3"
-description = "Binary Intake Gate — Stage 0.1b scaffold (Windows install fix)"
-authors = [{name="Your Name"}]
+version = "0.0.8"
+description = "Binary Intake Gate — binary & package intake scanner with policy engine"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10,<3.14"   # включает Python 3.13.7
+license = { file = "LICENSE" }
+authors = [{ name = "Иван" }]
+
+# при необходимости добавь runtime-зависимости сюда
+# dependencies = ["requests>=2.32"]
 
 [project.scripts]
 bin-gate = "bin_gate.cli:main"
 
+[project.optional-dependencies]
+# для разбора Python-пакетов (wheel/sdist), Requires-Dist и пр.
+pythonpkg = ["packaging>=24.1"]
+
+# статический анализ Python-кода
+sast = ["bandit>=1.7.9"]
+
+# асинхронные VT/API (batch lookup)
+async = ["httpx>=0.24"]
+
+# v0.0.8 Advanced Malware Detection
+emulation = ["speakeasy-emulator>=1.5"]
+oletools = ["oletools>=0.60"]
+visual = ["Pillow>=10.0"]
+threatintel = ["requests>=2.32"]
+
+# all advanced features
+advanced = [
+    "speakeasy-emulator>=1.5",
+    "oletools>=0.60",
+    "Pillow>=10.0",
+    "requests>=2.32",
+]
+
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["bin_gate*"]
+
+# Если нужно встраивать правила/политики в wheel, раскомментируй:
+# [tool.setuptools.package-data]
+# bin_gate = [
+#   "rules/*.yar",
+#   "capa-rules/**",
+#   "policy/*.yaml"
+# ]

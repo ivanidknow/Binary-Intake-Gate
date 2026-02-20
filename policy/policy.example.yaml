@@ -2,16 +2,12 @@ version: 2
 
 profiles:
   dev:
-    thresholds: { deny: 80, warn: 40 }
+    thresholds: { deny: 120, warn: 60 }   # было 80/40 → в dev мягче
   staging:
-    thresholds: { deny: 80, warn: 40 }
+    thresholds: { deny: 90, warn: 50 }
   prod:
     thresholds: { deny: 80, warn: 40 }
 
-# Правила используют "CEL-subset":
-#  - true/false/null, && || !, in/not in, сравнения
-#  - доступ к данным: pe.signature.present, vt.detections.stats.malicious, elf.hardening.pie и т.п.
-#  - ярлыки: yara_families (список строк), capa_tactics (список строк)
 rules:
   # --- AV / Reputation
   - id: kes-malicious
@@ -46,14 +42,25 @@ rules:
     score: 40
     reason: "ELF hardening weak (PIE/NX)"
 
-  - id: pe-no-cfg
-    when: pe and pe.hardening and pe.hardening.cfg == false
+  # CFG: развели веса по профилям
+  - id: pe-no-cfg-dev
+    when: 'meta and meta.profile == "dev" and pe and pe.hardening and pe.hardening.cfg == false'
+    score: 10
+    reason: "PE: CFG disabled (dev)"
+
+  - id: pe-no-cfg-prod
+    when: 'meta and (meta.profile == "prod" or meta.profile == "staging") and pe and pe.hardening and pe.hardening.cfg == false'
     score: 30
     reason: "PE: CFG disabled"
 
   # --- capa tactics
-  - id: capa-defense-evasion
-    when: "'defense-evasion' in capa_tactics"
+  - id: capa-defense-evasion-dev
+    when: 'meta and meta.profile == "dev" and "defense-evasion" in capa_tactics'
+    score: 20
+    reason: "capa tactic: defense-evasion (dev: soft)"
+
+  - id: capa-defense-evasion-prod
+    when: 'meta and (meta.profile == "prod" or meta.profile == "staging") and "defense-evasion" in capa_tactics'
     score: 60
     reason: "capa tactic: defense-evasion"
 
@@ -62,6 +69,7 @@ rules:
     score: 60
     reason: "capa tactic: credential-access"
 
+  # --- CVE
   - id: cve-critical
     when: cve and cve.summary and cve.summary.critical > 0
     then: deny
@@ -71,8 +79,260 @@ rules:
     when: cve and cve.summary and cve.summary.high > 0
     score: 60
     reason: "High-severity CVEs in dependencies"
-    
+
   - id: cve-medium-prod
     when: cve and cve.summary and cve.summary.medium > 0 and meta and meta.profile == "prod"
     score: 50
     reason: "Medium CVEs present (prod profile)"
+
+  # --- Reputation
+  - id: reputation-illicit-high
+    when: "reputation and reputation.counts and reputation.counts.illicit > 0"
+    then: deny
+    reason: "Reputation: illicit software indicators"
+
+  - id: reputation-scam
+    when: "reputation and reputation.counts and reputation.counts.scam > 0"
+    score: 60
+    reason: "Reputation: scam/fraud indicators"
+
+  - id: reputation-adult
+    when: "reputation and reputation.counts and reputation.counts.adult > 0 and meta and meta.profile == 'prod'"
+    score: 50
+    reason: "Reputation: adult content (brand safety)"
+
+  - id: reputation-profanity
+    when: "reputation and reputation.counts and reputation.counts.profanity > 0"
+    score: 30
+    reason: "Reputation: profanity"
+
+  - id: reputation-extremism-official
+    when: "reputation and reputation.counts and reputation.counts.extremism_official > 0"
+    then: deny
+    reason: "Reputation: officially-listed extremist org/symbols (jurisdictional)"
+
+  # NB: раньше у тебя было два одинаковых id 'repu-conflict-sensitive' — починил id
+  - id: repu-conflict-sensitive-core
+    when: "reputation and reputation.findings and 'conflict_sensitive_war' in reputation.categories"
+    score: 0
+    reason: "Text mentions conflict-related terms (review-only)"
+
+  - id: repu-conflict-sensitive-any
+    when: "reputation and reputation.findings and (
+            'conflict_sensitive_war' in reputation.categories or
+            'conflict_sensitive_war_geo' in reputation.categories or
+            'conflict_sensitive_war_ua' in reputation.categories
+          )"
+    score: 0
+    reason: "Text mentions conflict-related terms (review-only)"
+
+  # --- Obfuscation / Anti-analysis
+  # Снизили жёсткость: hard-денай оставили только для RWX и явных блокеров.
+  - id: obf-stringless-high-entropy
+    when: 'obfuscation and obfuscation.reasons and "stringless_high_entropy" in obfuscation.reasons'
+    score: 30  # было 40
+    reason: "Low strings ratio + high entropy (possible packing/crypto)"
+
+  # Объединили дубликаты 'obf-dynamic-resolve' и развели веса по профилям
+  - id: obf-dyn-api-dev
+    when: 'meta and meta.profile == "dev" and ( (obfuscation and obfuscation.has_dyn_api_resolve == true) or ("obf_dynresolve" in yara_families) )'
+    score: 10
+    reason: "Dynamic API resolution observed (dev soft)"
+
+  - id: obf-dyn-api-prod
+    when: 'meta and (meta.profile == "prod" or meta.profile == "staging") and ( (obfuscation and obfuscation.has_dyn_api_resolve == true) or ("obf_dynresolve" in yara_families) )'
+    score: 20
+    reason: "Dynamic API resolution observed"
+
+  - id: obf-anti-debug-yara
+    when: '"obf_antidebug" in yara_families'
+    score: 20  # было 30
+    reason: "Anti-debugging indicators present"
+
+  # Было then: deny → теперь профильно
+  - id: obf-high-total-dev
+    when: 'meta and meta.profile == "dev" and obfuscation and obfuscation.score != null and obfuscation.score >= 80'
+    score: 20
+    reason: "Strong obfuscation signals (dev: soft warning)"
+
+  - id: obf-high-total-prod
+    when: 'meta and (meta.profile == "prod" or meta.profile == "staging") and obfuscation and obfuscation.score != null and obfuscation.score >= 80'
+    score: 60
+    reason: "Strong obfuscation signals"
+
+  - id: obf-packed
+    when: obf and obf.packed_suspect == true
+    score: 30  # было 40
+    reason: Suspected packer/obfuscation
+
+  - id: obf-anti-debug
+    when: obf and 'anti_debug' in obf.reasons
+    score: 20  # было 30
+    reason: Anti-debug indicators
+
+  - id: obf-rwx-hard
+    when: obf and 'rwx_sections' in obf.reasons
+    then: deny
+    reason: RWX sections present (hard block)
+
+  # «Почти нет строк» — аккуратнее и с ленивой проверкой
+  - id: obf-stringless-high
+    when: obfuscation
+          and obfuscation.string_ratio_ascii != null
+          and obfuscation.string_ratio_utf16 != null
+          and (obfuscation.string_ratio_ascii + obfuscation.string_ratio_utf16) < 0.004
+          and obfuscation.max_section_entropy != null
+          and obfuscation.max_section_entropy >= 7.0
+    score: 30  # было 40
+    reason: "Very few strings with high overall entropy (stringless + high entropy)"
+
+  - id: obf-packed-sections
+    when: obfuscation and obfuscation.packed_suspect == true
+    score: 30  # было 40
+    reason: "Sections indicate packing/obfuscation"
+
+  - id: obf-mem-protect-injection-dev
+    when: 'meta and meta.profile == "dev" and obfuscation and ((obfuscation.uses_virtualprotect == true or obfuscation.uses_mprotect == true) or (obfuscation.uses_writeprocessmemory == true or obfuscation.uses_createremotethread == true))'
+    score: 30  # было 40
+    reason: "Memory protection change and/or remote thread/injection APIs present (dev soft)"
+
+  - id: obf-mem-protect-injection-prod
+    when: 'meta and (meta.profile == "prod" or meta.profile == "staging") and obfuscation and ((obfuscation.uses_virtualprotect == true or obfuscation.uses_mprotect == true) or (obfuscation.uses_writeprocessmemory == true or obfuscation.uses_createremotethread == true))'
+    score: 40
+    reason: "Memory protection change and/or remote thread/injection APIs present"
+
+  - id: obf-injection-apis
+    when: "obfuscation and (obfuscation.uses_writeprocessmemory == true or obfuscation.uses_createremotethread == true)"
+    score: 30
+    reason: "Подозрение на инжекцию (WPM/CreateRemoteThread)"
+
+  - id: packer-detected
+    when: "obfuscation and obfuscation.packer_families"
+    score: 40  # было 50
+    reason: "Обнаружены признаки упаковщика: ${obfuscation.packer_families}"
+
+  - id: packer-unsigned-pe
+    when: "pe and (pe.signature.present == false) and obfuscation and obfuscation.packer_families"
+    then: deny
+    reason: "Упакованный и неподписанный PE"
+
+  - id: obf-combo-highrisk
+    when: "obfuscation and obfuscation.packer_families and (obfuscation.has_dyn_api_resolve == true or (obfuscation.string_ratio_ascii != null and obfuscation.string_ratio_utf16 != null and (obfuscation.string_ratio_ascii + obfuscation.string_ratio_utf16) < 0.004))"
+    score: 30
+    reason: "Packer + dynamic resolve or very low strings"
+
+  # --- FLOSS (мягкие сигналы)
+  - id: floss-ioc-signal
+    when: strings_summary and (strings_summary.url_cnt + strings_summary.ip_cnt + strings_summary.cmd_cnt) >= 5
+    score: 15
+    reason: "Multiple IOC-like strings (URLs/IPs/commands)"
+
+  - id: floss-decoded-plus-stringless
+    when: strings_summary and strings_summary.decoded_cnt > 0
+          and obfuscation and obfuscation.string_ratio_ascii != null and obfuscation.string_ratio_utf16 != null
+          and (obfuscation.string_ratio_ascii + obfuscation.string_ratio_utf16) < 0.002
+    score: 20
+    reason: "Decoded strings present with very low static string ratio"
+
+  # --- Смягчители (anti-FP)
+  - id: signed-soften
+    when: pe and pe.signature and pe.signature.valid == true and pe.signature.chain_ok == true
+    score: -60
+    reason: "Signed binary with valid chain (soften)"
+
+  - id: vt-clean-soften
+    when: vt and vt.detections and vt.detections.stats.malicious == 0 and vt.detections.stats.suspicious == 0
+    score: -30
+    reason: "VT clean (no mal/suspicious detections)"
+
+  - id: elf-wx
+    when: elf.hardening.w_x_segments == true
+    then: deny
+    reason: "Нарушение W^X: сегменты с правами RWX"
+  - id: elf-textrel
+    when: elf.hardening.textrel == true
+    then: warn
+    reason: "TEXTREL (позиционно-зависимый код/relocs в .text)"
+  - id: elf-rpath-risky
+    when: elf.hardening.rpath_risky == true
+    then: warn
+    reason: "Небезопасный RPATH/RUNPATH"
+
+  # --- Жёсткие запреты/сильные предупреждения ---
+  - id: pe-driver-unsigned
+    when: "kind == 'PE' and pe.driver_like == true and pe.signature.valid != true"
+    score: 80
+    reason: "[pe-driver-unsigned] Driver-like PE без валидной подписи"
+    level_by_profile: { dev: warn, staging: deny, prod: deny }
+
+  - id: pe-wx
+    when: "kind == 'PE' and pe.sections.has_wx == true"
+    score: 25
+    reason: "[pe-wx] PE: секции с правами W+X"
+    level_by_profile: { dev: warn, staging: warn, prod: deny }
+
+  - id: pe-rwx
+    when: "kind == 'PE' and pe.sections.has_rwx == true"
+    score: 35
+    reason: "[pe-rwx] PE: секции RWX"
+    level_by_profile: { dev: warn, staging: deny, prod: deny }
+
+  # --- Усиление/ослабление защиты ---
+  - id: pe-aslr-not-effective
+    when: "kind == 'PE' and pe.hardening.aslr == true and pe.sections.relocs_present == false"
+    score: 12
+    reason: "[pe-aslr-not-effective] ASLR включён, но .reloc отсутствует (ASLR неэффективен)"
+
+  - id: pe-no-gs
+    when: "kind == 'PE' and pe.hardening.gs_cookie == false"
+    score: 8
+    reason: "[pe-no-gs] Нет GS-защиты стека (/GS)"
+
+  - id: pe-no-cfg-table
+    when: "kind == 'PE' and pe.hardening.cfg == true and pe.hardening.cfg_table == false"
+    score: 6
+    reason: "[pe-no-cfg-table] CFG включён без таблицы/инструментации (GuardFlags)"
+
+  - id: pe-safeseh-missing
+    when: "kind == 'PE' and pe.arch == 'x86' and pe.hardening.safeseh == false"
+    score: 5
+    reason: "[pe-safeseh-missing] x86 без SafeSEH"
+
+  # --- Манифест/метаданные/поведение ---
+  - id: pe-uac-admin
+    when: "kind == 'PE' and pe.resources.uac_level == 'requireAdministrator'"
+    score: 10
+    reason: "[pe-uac-admin] Манифест: requireAdministrator"
+
+  - id: pe-tls-callbacks
+    when: "kind == 'PE' and pe.tls_callbacks and pe.tls_callbacks > 0"
+    score: 10
+    reason: "[pe-tls-callbacks] TLS callbacks присутствуют"
+
+  - id: pe-unusual-sections
+    when: "kind == 'PE' and pe.sections.unusual_names and len(pe.sections.unusual_names) > 0"
+    score: 6
+    reason: "[pe-unusual-sections] Нестандартные секции: ${join(pe.sections.unusual_names, ', ')}"
+
+  - id: pe-high-overlay
+    when: "kind == 'PE' and pe.sections.overlay_pct and pe.sections.overlay_pct >= 5"
+    score: 6
+    reason: "[pe-high-overlay] Overlay ≥ 5% (${pe.sections.overlay_pct}%)"
+
+  # --- Софт-«смягчители» (отнимают очки) ---
+  - id: signed-soften
+    when: "kind == 'PE' and pe.signature.valid == true and pe.signature.chain_ok == true"
+    score: -8
+    reason: "Signed binary with valid chain (soften)"
+
+  - id: vt-clean-soften
+    when: "vt.detections.stats.malicious == 0 and vt.detections.stats.suspicious == 0"
+    score: -5
+    reason: "VT clean (no mal/suspicious detections)"
+
+  # При желании добавь локальный allowlist издателей:
+  # - id: publisher-allowlist-soften
+  #   when: pe and pe.signature and pe.signature.publisher != null and pe.signature.chain_ok == true
+  #         and ( pe.signature.publisher in ["Microsoft Corporation","Google LLC","Adobe Inc.","SignPath Foundation"] )
+  #   score: -30
+  #   reason: "Trusted publisher allowlist (soften)"

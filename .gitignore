@@ -1,0 +1,65 @@
+# Logs
+*.log
+cli_debug.log
+vt_debug.log
+
+# Reports (generated output)
+report.md
+report.json
+human_report.md
+*.sarif
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+*.pyd
+*.pyo
+*.pyc
+__pycache__/
+*.egg-info/
+
+# Temporary directories
+.tmp_bin_gate/
+.tmp/
+temp/
+
+# Archives
+*.rar
+*.zip
+*.7z
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+.venv/
+venv/
+env/
+*.egg
+.eggs/
+
+# Environment (secrets) — НЕ коммитить!
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Cache
+.cache/
+*.sqlite
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test examples (large binaries)
+examples/
+
