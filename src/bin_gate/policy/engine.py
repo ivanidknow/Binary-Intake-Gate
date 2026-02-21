@@ -107,7 +107,7 @@ def _derive_ctx(ev: Dict[str, Any]) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {}
 
     # Базовые разделы (словари либо None)
-    for k in ("pe", "elf", "vt", "kes", "hashes", "meta", "cve", "reputation"):
+    for k in ("pe", "elf", "vt", "kes", "hashes", "meta", "cve", "reputation", "die"):
         v = ev.get(k)
         ctx[k] = v if isinstance(v, dict) else None
 
@@ -135,9 +135,10 @@ def _derive_ctx(ev: Dict[str, Any]) -> Dict[str, Any]:
             "reasons": list((obf.get("reasons") or [])),
             "score": int(obf.get("score") or 0),
             "has_dyn_api_resolve": bool(obf.get("has_dyn_api_resolve") or False),
+            "packer_families": [str(x).lower() for x in (obf.get("packer_families") or [])],
         }
     else:
-        ctx["obfuscation"] = {"reasons": [], "score": 0, "has_dyn_api_resolve": False}
+        ctx["obfuscation"] = {"reasons": [], "score": 0, "has_dyn_api_resolve": False, "packer_families": []}
 
     # --- v0.0.8 Advanced Malware Detection ---
     
@@ -247,16 +248,17 @@ def _derive_ctx(ev: Dict[str, Any]) -> Dict[str, Any]:
             "obfuscation_score": 0, "obfuscation_techniques": [],
         }
     
-    # Supply chain (from v0.0.7)
+    # Supply chain (from v0.0.7; dependencies = URLs/external refs from LNK/Office/PDF)
     sc = ev.get("supply_chain")
     if isinstance(sc, dict):
         ctx["supply_chain"] = {
             "outdated_count": len(sc.get("outdated_libraries", [])),
             "risk_level": sc.get("risk_level"),
             "policy_reasons": sc.get("policy_reasons", []),
+            "dependencies": sc.get("dependencies", []),
         }
     else:
-        ctx["supply_chain"] = {"outdated_count": 0, "risk_level": None, "policy_reasons": []}
+        ctx["supply_chain"] = {"outdated_count": 0, "risk_level": None, "policy_reasons": [], "dependencies": []}
 
     return ctx
 
@@ -276,6 +278,41 @@ def _pick_profile(policy: Dict[str, Any], profile: str) -> Dict[str, Any]:
         "rules": rules,
     }
 
+# Critical errors that indicate incomplete analysis (false sense of security)
+# If these errors are present, the decision should be at least "warn"
+CRITICAL_ERROR_PATTERNS = (
+    "die_error",           # DIE packer detection failed
+    "cve_error",           # CVE scanning failed
+    "cve_batch_error",     # Batch CVE scanning failed
+    "vt_error",            # VirusTotal API error
+    "vt_no_api_key",       # VT API key not configured
+    "emulation_error",     # Speakeasy emulation failed
+    "ti_error",            # Threat Intelligence failed
+    "docker_error",        # Docker container failed
+    "syft_error",          # Syft SBOM generation failed
+    "grype_error",         # Grype vulnerability scan failed
+)
+
+def _check_critical_errors(ev: Dict[str, Any]) -> List[str]:
+    """
+    Check for critical analysis errors that indicate incomplete analysis.
+    Returns list of found critical errors.
+    """
+    errors = ev.get("errors") or []
+    if not isinstance(errors, list):
+        errors = [str(errors)] if errors else []
+    
+    found_critical: List[str] = []
+    for err in errors:
+        err_str = str(err).lower()
+        for pattern in CRITICAL_ERROR_PATTERNS:
+            if pattern.lower() in err_str:
+                found_critical.append(str(err))
+                break
+    
+    return found_critical
+
+
 def evaluate_policy(ev: Dict[str, Any], policy: Dict[str, Any], profile: str = "dev") -> Dict[str, Any]:
     """
     Возвращает:
@@ -283,7 +320,8 @@ def evaluate_policy(ev: Dict[str, Any], policy: Dict[str, Any], profile: str = "
         decision: 'allow'|'warn'|'deny',
         score: int,
         reasons: [str],    # "[rule-id] текст"
-        matched: [rule-id]
+        matched: [rule-id],
+        critical_errors: [str]  # v0.0.8: list of critical analysis errors
       }
     """
     eff = _pick_profile(policy, profile)
@@ -331,9 +369,62 @@ def evaluate_policy(ev: Dict[str, Any], policy: Dict[str, Any], profile: str = "
     elif total_score >= int(thr["warn"]):
         decision = "warn"
 
+    # v0.0.8: Check for critical analysis errors
+    # A "clean" report due to missing data is a false sense of security
+    critical_errors = _check_critical_errors(ev)
+    if critical_errors and decision == "allow":
+        decision = "warn"
+        for err in critical_errors:
+            reasons.append(f"[incomplete-analysis] Critical error: {err}")
+        # Add score penalty for incomplete analysis
+        total_score += 30
+
+    # Policy lockdown: if DIE or CVE scanners failed, decision MUST be at least WARN
+    evidence_errors = ev.get("errors") or []
+    if not isinstance(evidence_errors, list):
+        evidence_errors = [str(evidence_errors)] if evidence_errors else []
+    scanner_failures = [e for e in evidence_errors if isinstance(e, str) and (e.strip().startswith("die_") or e.strip().startswith("cve_"))]
+    if scanner_failures and decision == "allow":
+        decision = "warn"
+        for err in scanner_failures[:5]:
+            reasons.append(f"[scanner-failure] {err}")
+        total_score += 40
+
+    # VMProtect lockdown: Protector: VMProtect -> DENY (prod) or WARN (dev)
+    # Especially strict when combined with high VirusTotal detections
+    vmprotect_detected = False
+    die_data = ev.get("die")
+    if isinstance(die_data, dict):
+        detects = die_data.get("detects") or []
+        for d in detects:
+            if isinstance(d, str) and "vmprotect" in d.lower():
+                vmprotect_detected = True
+                break
+    if not vmprotect_detected:
+        packers = (ctx.get("obfuscation") or {}).get("packer_families") or []
+        vmprotect_detected = any("vmprotect" in str(p).lower() for p in packers)
+    vt_malicious = 0
+    vt_data = ev.get("vt")
+    if isinstance(vt_data, dict):
+        stats = vt_data.get("last_analysis_stats") or vt_data.get("stats") or {}
+        vt_malicious = int(stats.get("malicious") or stats.get("malicious_count") or 0)
+    high_vt = vt_malicious >= 5  # Configurable threshold
+    if vmprotect_detected:
+        if profile == "prod":
+            decision = "deny"
+            reasons.append("[vmprotect] Protector: VMProtect detected — DENY (prod)")
+            if high_vt:
+                reasons.append("[vmprotect] High VirusTotal detections — reinforced DENY")
+            total_score = max(total_score, 100)
+        elif profile == "dev" and decision == "allow":
+            decision = "warn"
+            reasons.append("[vmprotect] Protector: VMProtect detected — WARN (dev)")
+            total_score += 50
+
     return {
         "decision": decision,
         "score": int(total_score),
         "reasons": reasons,
         "matched": matched_ids,
+        "critical_errors": critical_errors,
     }

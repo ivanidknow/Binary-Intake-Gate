@@ -17,6 +17,23 @@ import os
 import re
 import string
 import math
+import threading
+
+# Log to cli_debug.log for Docker/JSON debugging (no dependency on cli)
+_die_log_lock = threading.Lock()
+DIE_DEBUG_LOG_MAX_CHARS = 2000  # Max raw output to log per call
+
+
+def _die_log(msg: str) -> None:
+    """Append a line to cli_debug.log for DIE debugging."""
+    with _die_log_lock:
+        try:
+            log_path = os.path.join(os.getcwd(), "cli_debug.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[die_scanner] {msg}\n")
+        except Exception:
+            pass
+
 
 from ..docker_utils import (
     check_docker_available, image_exists, pull_image,
@@ -28,6 +45,123 @@ from ..docker_utils import (
 # Configuration
 # ---------------------------------------------------------------------------
 DIE_TIMEOUT_SEC = 60
+# Executable name/path inside the container (e.g. "diec" or "/usr/bin/diec")
+# Set DIE_EXECUTABLE if your image uses a different path or ENTRYPOINT
+# For horsicq:diec image we use /usr/bin/diec explicitly
+DIE_EXECUTABLE = os.getenv("DIE_EXECUTABLE", "diec")
+
+
+def _die_executable_for_image(image: str) -> str:
+    """Return the diec executable path for the given image. horsicq:diec uses /usr/bin/diec."""
+    if not image:
+        return DIE_EXECUTABLE
+    img = image.split(":")[0].lower()
+    if "horsicq" in img or image.strip().startswith("horsicq"):
+        return "/usr/bin/diec"
+    return DIE_EXECUTABLE
+
+
+def _extract_json_blocks(text: str) -> List[str]:
+    """
+    Extract one or more JSON object blocks from diec stdout.
+    diec may prefix JSON with a filename line (e.g. '/target/file:\\n' or 'path:\\n').
+    Returns list of JSON substrings (each starts with { and has balanced braces).
+    """
+    if not text or not text.strip():
+        return []
+    blocks: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Find next '{'
+        start = text.find("{", i)
+        if start == -1:
+            break
+        depth = 0
+        j = start
+        while j < n:
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[start : j + 1])
+                    i = j + 1
+                    break
+            elif ch == '"' and j > 0 and text[j - 1] != "\\":
+                # Skip string content so we don't count braces inside strings
+                k = j + 1
+                while k < n:
+                    if text[k] == "\\":
+                        k += 2
+                        continue
+                    if text[k] == '"':
+                        j = k
+                        break
+                    k += 1
+            j += 1
+        else:
+            # Unbalanced, skip this { and continue
+            i = start + 1
+    return blocks
+
+
+def _parse_die_stdout_single(stdout: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Parse single-file diec stdout: may contain 'path:\\n' then JSON.
+    Returns (parsed_dict, error_message).
+    """
+    blocks = _extract_json_blocks(stdout)
+    if not blocks:
+        return None, "die_empty_output"
+    try:
+        return json.loads(blocks[0]), ""
+    except json.JSONDecodeError as e:
+        return None, f"die_json_error:{e}; raw_begin={blocks[0][:100]!r}"
+
+
+def _path_line_before(json_start_pos: int, text: str) -> Optional[str]:
+    """Find the last line before json_start_pos that looks like 'path:' (filename prefix from diec)."""
+    before = text[:json_start_pos]
+    lines = before.splitlines()
+    for line in reversed(lines):
+        s = line.strip()
+        if s.endswith(":") and not s.startswith("{"):
+            return s.rstrip(":").strip()
+    return None
+
+
+def _parse_die_stdout_batch(stdout: str) -> Tuple[Optional[Any], str]:
+    """
+    Parse batch diec stdout: multiple 'path:\\n' lines and JSON blocks per file.
+    Returns (structure for _index_results, error_message).
+    """
+    blocks = _extract_json_blocks(stdout)
+    if not blocks:
+        return None, "die_empty_output"
+    parsed: List[Dict[str, Any]] = []
+    pos = 0
+    for raw in blocks:
+        start = stdout.find(raw, pos)
+        if start == -1:
+            start = pos
+        path = _path_line_before(start, stdout)
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                if path and not (obj.get("filename") or obj.get("file") or obj.get("path")):
+                    obj["file"] = path
+                    obj["filename"] = path
+                parsed.append(obj)
+        except json.JSONDecodeError:
+            pass
+        pos = start + len(raw)
+    if not parsed:
+        return None, "die_json_error:no_valid_blocks"
+    if len(parsed) == 1:
+        return parsed[0], ""
+    return parsed, ""
 
 PRINTABLE = set(bytes(string.printable, "ascii"))
 MIN_STR_LEN = 4
@@ -259,15 +393,21 @@ class DieScanner:
                 host_path_str = f"/{drive}{host_path_str[2:].replace(os.sep, '/')}"
 
         # Run DIE with JSON output
-        # DIE command: diec -j <file> (JSON output)
+        # -j / --json: JSON output. Volume: file mapped to /target inside container
+        # horsicq:diec image: use /usr/bin/diec -j /target explicitly
+        die_exe = _die_executable_for_image(self.config.image)
         cmd = [
             "docker", "run",
             "--rm" if self.config.cleanup_containers else "",
-            "-v", f"{host_path_str}:/target/file:ro",
+            "-v", f"{host_path_str}:/target:ro",
             self.config.image,
-            "diec", "-j", "/target/file",
         ]
+        if die_exe:
+            cmd.append(die_exe)
+        cmd.extend(["-j", "/target"])
         cmd = [c for c in cmd if c]
+        _die_log(f"DEBUG: DIE command: {' '.join(cmd)}")
+        _die_log(f"single-file cmd: {' '.join(cmd)}")
 
         try:
             result = subprocess.run(
@@ -277,19 +417,35 @@ class DieScanner:
                 timeout=self.config.timeout,
             )
 
-            # DIE may return non-zero for some files, but still produce valid JSON
-            stdout = result.stdout.strip()
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+
+            _die_log(f"single-file path={host_path} returncode={result.returncode} stdout_len={len(stdout)} stderr_len={len(stderr)}")
+            if stdout:
+                _die_log(f"single-file raw_stdout (first {DIE_DEBUG_LOG_MAX_CHARS} chars): {stdout[:DIE_DEBUG_LOG_MAX_CHARS]!r}")
+            if stderr:
+                _die_log(f"single-file raw_stderr (first 500 chars): {stderr[:500]!r}")
+
             if not stdout:
                 if result.returncode != 0:
-                    stderr_snip = (result.stderr or "")[:200]
+                    stderr_snip = stderr[:200]
                     return None, f"die_exit_{result.returncode}:{stderr_snip}"
+                _die_log("single-file: empty output -> die_empty_output")
                 return None, "die_empty_output"
 
-            try:
-                die_out = json.loads(stdout)
-                return die_out, ""
-            except json.JSONDecodeError as e:
-                return None, f"die_json_error:{e}"
+            die_out, err = _parse_die_stdout_single(stdout)
+            if err:
+                _die_log(f"single-file parse: {err}")
+                if "die_json_error" in err:
+                    _die_log("single-file FULL stdout on JSON error:")
+                    for line in stdout.splitlines():
+                        _die_log(f"  | {line[:500]}")
+                    if stderr:
+                        _die_log("single-file FULL stderr on JSON error:")
+                        for line in stderr.splitlines():
+                            _die_log(f"  | {line[:500]}")
+                return None, err
+            return die_out, ""
 
         except subprocess.TimeoutExpired:
             return None, f"die_timeout:{self.config.timeout}s"
@@ -820,16 +976,21 @@ class DieBatchMap:
                 host_path_str = f"/{drive}{host_path_str[2:].replace(os.sep, '/')}"
                 
         # Запуск DIE с рекурсивным сканированием
-        # diec -j -r /target — JSON output, recursive
+        # horsicq:diec: use /usr/bin/diec -j -r /target
+        die_exe = _die_executable_for_image(self.config.image)
         cmd = [
             "docker", "run",
             "--rm" if self.config.cleanup_containers else "",
             "-v", f"{host_path_str}:/target:ro",
             self.config.image,
-            "diec", "-j", "-r", "/target",
         ]
+        if die_exe:
+            cmd.append(die_exe)
+        cmd.extend(["-j", "-r", "/target"])
         cmd = [c for c in cmd if c]
-        
+        _die_log(f"DEBUG: DIE command: {' '.join(cmd)}")
+        _die_log(f"batch cmd: {' '.join(cmd)}")
+
         try:
             proc_result = subprocess.run(
                 cmd,
@@ -837,19 +998,39 @@ class DieBatchMap:
                 text=True,
                 timeout=self.config.timeout * 3,  # Увеличенный таймаут для batch
             )
-            
-            if proc_result.returncode != 0 and not proc_result.stdout:
-                stderr_snip = (proc_result.stderr or "")[:300]
-                result.error = f"die_exit_{proc_result.returncode}:{stderr_snip}"
+
+            stdout = (proc_result.stdout or "").strip()
+            stderr = (proc_result.stderr or "").strip()
+
+            _die_log(f"batch dir={directory} returncode={proc_result.returncode} stdout_len={len(stdout)} stderr_len={len(stderr)}")
+            if stdout:
+                _die_log(f"batch raw_stdout (first {DIE_DEBUG_LOG_MAX_CHARS} chars): {stdout[:DIE_DEBUG_LOG_MAX_CHARS]!r}")
+            if stderr:
+                _die_log(f"batch raw_stderr (first 500 chars): {stderr[:500]!r}")
+
+            if not stdout:
+                if proc_result.returncode != 0:
+                    stderr_snip = stderr[:300]
+                    result.error = f"die_exit_{proc_result.returncode}:{stderr_snip}"
+                else:
+                    result.error = "die_empty_output"
+                    _die_log("batch: empty output -> die_empty_output")
                 return result
-                
-            # Парсим JSON
-            try:
-                die_output = json.loads(proc_result.stdout)
-            except json.JSONDecodeError as e:
-                result.error = f"die_json_error:{e}"
+
+            # Extract only JSON blocks (diec prints path: then {...} per file)
+            die_output, parse_err = _parse_die_stdout_batch(stdout)
+            if parse_err:
+                result.error = f"die_{parse_err}"
+                _die_log(f"batch parse: {result.error}")
+                _die_log("batch FULL stdout on parse error:")
+                for line in (stdout or "").splitlines():
+                    _die_log(f"  | {line[:500]}")
+                if stderr:
+                    _die_log("batch FULL stderr:")
+                    for line in stderr.splitlines():
+                        _die_log(f"  | {line[:500]}")
                 return result
-                
+
             result.raw_output = die_output
             
             # Индексируем результаты

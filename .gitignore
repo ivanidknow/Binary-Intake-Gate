@@ -54,7 +54,7 @@ env/
 .cache/
 *.sqlite
 *.db
-
+CURSOR.md
 # OS
 .DS_Store
 Thumbs.db

@@ -26,9 +26,24 @@ from ..docker_utils import (
     SYFT_IMAGE, GRYPE_IMAGE, DockerNotAvailableError,
 )
 
-DOCKER_TIMEOUT_SEC = 120
-SYFT_TIMEOUT_SEC = 90
-GRYPE_TIMEOUT_SEC = 90
+DOCKER_TIMEOUT_SEC = 300
+
+import threading
+
+_cve_log_lock = threading.Lock()
+
+
+def _cve_log(msg: str) -> None:
+    """Append a line to cli_debug.log for CVE/Syft/Grype diagnostics."""
+    with _cve_log_lock:
+        try:
+            log_path = os.path.join(os.getcwd(), "cli_debug.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[cve_collector] {msg}\n")
+        except Exception:
+            pass
+SYFT_TIMEOUT_SEC = 300
+GRYPE_TIMEOUT_SEC = 300
 
 
 # ---------------------------------------------------------------------------
@@ -375,22 +390,21 @@ def _image_exists(image: str) -> bool:
         return False
 
 
-def _pull_image(image: str, timeout: int = 300) -> Tuple[bool, str]:
-    """Pull Docker image if not present. Returns (success, error_message)."""
-    try:
-        result = subprocess.run(
-            ["docker", "pull", image],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode == 0:
-            return True, ""
-        return False, f"docker pull failed: {result.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return False, f"docker pull timeout ({timeout}s)"
-    except Exception as e:
-        return False, f"docker pull error: {e}"
+def _pull_image(image: str, timeout: int = 300, retries: int = 3) -> Tuple[bool, str]:
+    """
+    Pull Docker image with retry mechanism.
+    
+    Args:
+        image: Docker image name
+        timeout: Timeout per attempt in seconds
+        retries: Number of retry attempts (default: 3)
+    
+    Returns:
+        (success, error_message)
+    """
+    # Use centralized pull_image from docker_utils
+    from ..docker_utils import pull_image
+    return pull_image(image, timeout, retries)
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +496,10 @@ class ContainerVulnerabilityScanner:
                 stderr_snip = (result.stderr or "")[:300]
                 return None, f"syft_exit_{result.returncode}:{stderr_snip}"
 
+            # Diagnostic: log raw SBOM output (first 500 chars)
+            raw_stdout = (result.stdout or "").strip()
+            _cve_log(f"Syft raw SBOM (first 500 chars): {raw_stdout[:500]!r}")
+
             # Parse SBOM JSON from stdout
             try:
                 sbom = json.loads(result.stdout)
@@ -548,6 +566,12 @@ class ContainerVulnerabilityScanner:
 
             try:
                 grype_out = json.loads(result.stdout)
+                matches = grype_out.get("matches") if isinstance(grype_out, dict) else None
+                if not grype_out or (isinstance(matches, list) and len(matches) == 0):
+                    _cve_log(
+                        "Grype returned empty or no matches. "
+                        "Check if vulnerability database is initialized: run 'bin-gate cve-update' or 'docker run --rm anchore/grype:latest db update'"
+                    )
                 return grype_out, ""
             except json.JSONDecodeError as e:
                 return None, f"grype_json_error:{e}"
@@ -903,13 +927,16 @@ class BatchVulnerabilityMap:
             if result.returncode != 0:
                 stderr_snip = (result.stderr or "")[:300]
                 return None, f"exit_{result.returncode}:{stderr_snip}"
-                
+
+            raw_stdout = (result.stdout or "").strip()
+            _cve_log(f"Syft batch raw SBOM (first 500 chars): {raw_stdout[:500]!r}")
+
             try:
                 sbom = json.loads(result.stdout)
                 return sbom, ""
             except json.JSONDecodeError as e:
                 return None, f"json_error:{e}"
-                
+
         except subprocess.TimeoutExpired:
             return None, f"timeout:{self.config.syft_timeout * 2}s"
         except Exception as e:

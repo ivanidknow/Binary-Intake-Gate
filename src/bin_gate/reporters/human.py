@@ -2802,8 +2802,6 @@ def write_human_report(
     lines.append("5) *Проверка антивирусом KES:*")
     _append_av_section(lines, evidences, summary)
 
-    _append_recommendations_summary(lines, evidences)
-
     # --- ВЫВОД ---
     lines.append("*ВЫВОД*((/))*")
     # Вывести итог по «худшей» политике

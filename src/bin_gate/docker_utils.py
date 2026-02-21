@@ -21,7 +21,7 @@ DIE_CACHE_VOLUME = "bin-gate-die-cache"
 # Docker images
 SYFT_IMAGE = "anchore/syft:latest"
 GRYPE_IMAGE = "anchore/grype:latest"
-DIE_IMAGE = "horsicq/detectiteasy:latest"
+DIE_IMAGE = "horsicq:diec"  # Custom local DIE image
 
 
 class DockerNotAvailableError(Exception):
@@ -148,22 +148,58 @@ def image_exists(image: str) -> bool:
         return False
 
 
-def pull_image(image: str, timeout: int = 300) -> Tuple[bool, str]:
-    """Pull Docker image if not present."""
-    try:
-        result = subprocess.run(
-            ["docker", "pull", image],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode == 0:
-            return True, ""
-        return False, result.stderr[:500]
-    except subprocess.TimeoutExpired:
-        return False, f"pull timeout ({timeout}s)"
-    except Exception as e:
-        return False, str(e)
+def pull_image(image: str, timeout: int = 300, retries: int = 3) -> Tuple[bool, str]:
+    """
+    Pull Docker image with retry mechanism.
+    
+    Args:
+        image: Docker image name (e.g., 'anchore/syft:latest')
+        timeout: Timeout per attempt in seconds
+        retries: Number of retry attempts (default: 3)
+    
+    Returns:
+        (success, error_message)
+    """
+    import time
+    
+    last_error = ""
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                ["docker", "pull", image],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if result.returncode == 0:
+                return True, ""
+            
+            last_error = result.stderr[:500].strip()
+            
+            # Check for specific error conditions
+            if "pull access denied" in last_error.lower():
+                return False, f"Image not found or access denied: {image}. Check the image name is correct."
+            if "not found" in last_error.lower():
+                return False, f"Image not found: {image}. Verify the image exists on Docker Hub."
+            if "unauthorized" in last_error.lower():
+                return False, f"Unauthorized access to {image}. Check Docker Hub credentials if private."
+            
+            # Retry on transient errors
+            if attempt < retries:
+                time.sleep(2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                continue
+                
+        except subprocess.TimeoutExpired:
+            last_error = f"pull timeout ({timeout}s)"
+            if attempt < retries:
+                continue
+        except Exception as e:
+            last_error = str(e)
+            if attempt < retries:
+                time.sleep(2)
+                continue
+    
+    return False, f"{last_error}. Check internet connection and image name: {image}"
 
 
 def ensure_images(images: Optional[List[str]] = None) -> dict[str, bool]:

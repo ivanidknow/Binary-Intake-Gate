@@ -1,6 +1,14 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional, Tuple, List
 import os, time, requests
+
+# Load .env if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 HARDCODED_VT_API_KEY = ""  # REMOVED: use VT_API_KEY env variable or --vt-api-key CLI arg
 VT_API = "https://www.virustotal.com/api/v3"
 DEFAULT_TIMEOUT = int(os.getenv("VT_TIMEOUT_SEC", "20"))
@@ -11,15 +19,34 @@ _last_call: Optional[float] = None
 _min_interval: float = DEFAULT_MIN_INTERVAL
 
 
+class ConfigurationError(Exception):
+    """Raised when VT_API_KEY is not set but required for the operation."""
+    pass
+
+
 def _api_key(explicit: Optional[str] = None) -> Optional[str]:
     # порядок приоритета: явный → переменная окружения → захардкоженный ключ
     return explicit or os.getenv("VT_API_KEY") or HARDCODED_VT_API_KEY
 
+
+def ensure_vt_api_key(explicit: Optional[str] = None) -> str:
+    """
+    Return the VT API key or raise ConfigurationError if missing.
+    Use this before making API calls to fail fast with a clear message.
+    """
+    k = _api_key(explicit)
+    if not k or not str(k).strip():
+        raise ConfigurationError(
+            "VT_API_KEY is not set. Set it in .env (copy from .env.example) or pass --vt-api-key."
+        )
+    return str(k).strip()
+
 def fetch_network_relations(sha256: str, *, key: Optional[str]=None,
                             timeout: int=DEFAULT_TIMEOUT, min_interval: float=DEFAULT_MIN_INTERVAL
                            ) -> Tuple[Dict[str, list], list[str]]:
-    k = _api_key(key); errs: list[str] = []; out = {"domains": [], "ips": [], "http": []}
-    if not k: return out, ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
+    errs: list[str] = []
+    out = {"domains": [], "ips": [], "http": []}
 
     def _rel(path: str) -> list[str]:
         try:
@@ -55,8 +82,8 @@ def fetch_behaviour_details(sha256: str, *, key: Optional[str]=None,
     summary, network, files, registry, processes, mutexes, mitre_attack, key_counts.
     Склеивает /behaviour_summary и /behaviour.
     """
-    k = _api_key(key); errs: List[str] = []
-    if not k: return [], ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
+    errs: List[str] = []
 
     def _json_or(path: str) -> Dict[str, Any] | List[Any]:
         try:
@@ -191,9 +218,7 @@ def normalize_summary(file_doc: Dict[str, Any]) -> Dict[str, Any]:
 
 def lookup_by_sha256(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAULT_TIMEOUT, min_interval: float=DEFAULT_MIN_INTERVAL) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     errs: List[str] = []
-    k = _api_key(key)
-    if not k:
-        return None, ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
     try:
         r = _get(f"/files/{sha256}", k, timeout, min_interval)
     except requests.Timeout:
@@ -215,8 +240,8 @@ def lookup_by_sha256(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAU
 def fetch_behaviours(sha256: str, *, key: Optional[str]=None,
                      timeout: int=DEFAULT_TIMEOUT, min_interval: float=DEFAULT_MIN_INTERVAL
                     ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    k = _api_key(key); errs: List[str] = []
-    if not k: return [], ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
+    errs: List[str] = []
     try:
         r = _get(f"/files/{sha256}/behaviours", k, timeout, min_interval)
     except requests.Timeout:
@@ -253,8 +278,8 @@ def fetch_behaviours(sha256: str, *, key: Optional[str]=None,
     return out, errs
 
 def fetch_detections(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAULT_TIMEOUT, min_interval: float=DEFAULT_MIN_INTERVAL, max_results: int=20) -> Tuple[Dict[str, Any], List[str]]:
-    k = _api_key(key); errs: List[str] = []
-    if not k: return {}, ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
+    errs: List[str] = []
     try:
         r = _get(f"/files/{sha256}", k, timeout, min_interval)
     except requests.Timeout:
@@ -274,8 +299,8 @@ def fetch_detections(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAU
     return {"engines": top, "stats": attr.get("last_analysis_stats", {})}, errs
 
 def fetch_relations(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAULT_TIMEOUT, min_interval: float=DEFAULT_MIN_INTERVAL) -> Tuple[Dict[str, Any], List[str]]:
-    k = _api_key(key); errs: List[str] = []
-    if not k: return {}, ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
+    errs: List[str] = []
     kinds = ["contacted_urls","contacted_domains","contacted_ips","bundled_files"]
     out: Dict[str, Any] = {}
     for rel in kinds:
@@ -300,8 +325,8 @@ def fetch_relations(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAUL
     return out, errs
 
 def fetch_comments(sha256: str, *, key: Optional[str]=None, timeout: int=DEFAULT_TIMEOUT, min_interval: float=DEFAULT_MIN_INTERVAL, max_items: int=5) -> Tuple[List[Dict[str, Any]], List[str]]:
-    k = _api_key(key); errs: List[str] = []
-    if not k: return [], ["vt_no_api_key"]
+    k = ensure_vt_api_key(key)
+    errs: List[str] = []
     try:
         r = _get(f"/files/{sha256}/comments", k, timeout, min_interval)
     except requests.Timeout:
@@ -425,8 +450,10 @@ def vt_wait_behaviours_raw(sha256: str, *, api_key: str,
     Один запрос GET /behaviours на хэш. Пустой data (200) = «нет сессий», сразу возврат без поллинга.
     В рамках запуска кэш по sha256 — повторные вызовы без сети. При 429 — до 3 ретраев с backoff.
     """
-    if not api_key:
-        return [], ["vt_no_api_key"]
+    if not api_key or not str(api_key).strip():
+        raise ConfigurationError(
+            "VT_API_KEY is not set. Set it in .env (copy from .env.example) or pass --vt-api-key."
+        )
     cached = _behaviours_run_cache.get(sha256)
     if cached is not None:
         vt_debug_log(f"[vt_wait_behaviours_raw] sha256={sha256[:16]}... ENTER cache_hit=True -> return sessions={len(cached[0])} (no GET)")

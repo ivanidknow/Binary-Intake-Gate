@@ -49,12 +49,13 @@ class Evidence:
     # .NET assembly intelligence
     dotnet: Optional[Dict[str, Any]] = None
     
-    # Supply chain risk (outdated critical libraries)
+    # Supply chain risk (outdated critical libraries + referenced URLs/external resources)
     supply_chain: Dict[str, Any] = field(
         default_factory=lambda: {
             "outdated_libraries": [],
             "policy_reasons": [],
             "risk_level": None,  # "critical", "high", "medium", "low", None
+            "dependencies": [],  # [{type, value, source}] from LNK/Office/PDF URLs and external refs
         }
     )
     

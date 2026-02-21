@@ -9,6 +9,10 @@ from typing import Dict, Any, List, Optional
 CAPA_TIMEOUT = int(__import__("os").getenv("CAPA_TIMEOUT_SEC", "120"))
 DIE_TIMEOUT = int(__import__("os").getenv("DIE_TIMEOUT_SEC", "60"))
 
+# v0.0.8 Advanced Malware Detection timeouts
+EMULATION_TIMEOUT = int(__import__("os").getenv("BIN_GATE_EMULATION_TIMEOUT", "60"))
+TI_TIMEOUT = int(__import__("os").getenv("BIN_GATE_TI_TIMEOUT", "30"))
+
 # Aggressive gating: files > 50 MB that are not archive/MSI run only hashes, entropy, YARA
 AGGRESSIVE_GATE_MB = 50
 ARCHIVE_MSI_SUFFIXES = frozenset({".zip", ".msi", ".jar", ".apk", ".aab", ".7z", ".rar", ".tar", ".gz", ".tgz", ".whl", ".nupkg", ".msix", ".appx", ".vsix", ".deb", ".rpm", ".ova", ".ovf"})
@@ -381,7 +385,165 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
         except Exception as e:
             errors.append(f"webshell_error:{e}")
 
+    # -------------------------------------------------------------------------
+    # Advanced Malware Detection (v0.0.8)
+    # -------------------------------------------------------------------------
+    emulation_sec = 0.0
+    ti_sec = 0.0
+    
+    # Initialize v0.0.8 fields
+    out["emulation"] = None
+    out["threat_intel"] = None
+    out["visual"] = None
+    out["script_analysis"] = None
+    
+    # --- Emulation (Speakeasy) ---
+    if opt("emulation", False) and kind == "PE" and not skip_heavy:
+        t_emu = time.perf_counter()
+        try:
+            from .emulation import run_emulation, merge_emulation_to_capa
+            emu_timeout = int(opt("emulation_timeout", EMULATION_TIMEOUT))
+            emu_max_mb = int(opt("emulation_max_mb", 50))
+            
+            if emu_max_mb <= 0 or (file_size <= emu_max_mb * 1024 * 1024):
+                emu_result = run_emulation(
+                    path,
+                    timeout=emu_timeout,
+                    enable=True,
+                    file_type="PE",
+                )
+                if emu_result:
+                    out["emulation"] = emu_result
+                    # Merge emulation results into capa techniques
+                    if out.get("capa"):
+                        out["capa"] = merge_emulation_to_capa(emu_result, out["capa"])
+                    # Push Speakeasy API interception results into supply_chain.dependencies
+                    _emulation_deps: List[Dict[str, Any]] = []
+                    import re as _re
+                    for s in (emu_result.get("decoded_strings") or []):
+                        if not isinstance(s, str):
+                            continue
+                        for m in _re.finditer(r"https?://[^\s<>\"'\]]+", s):
+                            _emulation_deps.append({"type": "url", "value": m.group(0)[:500], "source": "emulation_decoded_strings"})
+                    for conn in (emu_result.get("network") or []):
+                        if isinstance(conn, dict):
+                            for p in (conn.get("params") or [])[:3]:
+                                ps = str(p).strip()
+                                if _re.match(r"https?://", ps):
+                                    _emulation_deps.append({"type": "url", "value": ps[:500], "source": "emulation_network"})
+                    for key in ("created", "read", "written"):
+                        for f in (emu_result.get("files") or {}).get(key) or []:
+                            if isinstance(f, str) and f.strip():
+                                _emulation_deps.append({"type": "file_ref", "value": f.strip()[:500], "source": f"emulation_files_{key}"})
+                    if _emulation_deps:
+                        out.setdefault("supply_chain", {}).setdefault("dependencies", []).extend(_emulation_deps)
+        except Exception as e:
+            errors.append(f"emulation_error:{e}")
+        emulation_sec = time.perf_counter() - t_emu
+    
+    # --- Threat Intelligence ---
+    if opt("ti", False):
+        t_ti = time.perf_counter()
+        try:
+            from .threat_intel import analyze_threat_intel, merge_ti_to_reputation
+            ti_timeout = int(opt("ti_timeout", TI_TIMEOUT))
+            enable_dga = not opt("no_dga", False)
+            
+            # Collect strings from various sources
+            all_strings: List[str] = []
+            if out.get("strings") and out["strings"].get("static"):
+                all_strings.extend(out["strings"]["static"][:1000])
+            if out.get("die") and out["die"].get("strings"):
+                all_strings.extend(out["die"]["strings"][:500])
+            
+            # Also add emulation network data if available
+            emu_data = out.get("emulation")
+            
+            ti_result = analyze_threat_intel(
+                strings=all_strings,
+                emulation_data=emu_data,
+                enable_ti=True,
+                enable_dga=enable_dga,
+                timeout=ti_timeout,
+            )
+            if ti_result:
+                out["threat_intel"] = ti_result
+                # Merge TI results into reputation
+                if out.get("reputation"):
+                    out["reputation"] = merge_ti_to_reputation(ti_result, out["reputation"])
+        except Exception as e:
+            errors.append(f"ti_error:{e}")
+        ti_sec = time.perf_counter() - t_ti
+    
+    # --- Visual Analysis (PE icons) ---
+    # Note: Icon extraction is already integrated into pe_hardening.py
+    # We just need to populate the visual field from PE info if visual is enabled
+    if opt("visual", True) and kind == "PE" and out.get("pe"):
+        try:
+            pe_info = out["pe"]
+            visual_data: Dict[str, Any] = {
+                "icon": pe_info.get("icon"),
+                "resource_entropy": pe_info.get("resource_entropy"),
+                "icon_mismatch": False,
+                "masquerading_suspect": False,
+            }
+            # Check for masquerading
+            icon_info = pe_info.get("icon") or {}
+            if icon_info.get("masquerading"):
+                visual_data["icon_mismatch"] = True
+                visual_data["masquerading_suspect"] = True
+                visual_data["masquerading_details"] = icon_info.get("masquerading_details")
+                if "icon_masquerading" not in out["obfuscation"].get("reasons", []):
+                    out["obfuscation"]["reasons"] = list(set(out["obfuscation"].get("reasons", []) + ["icon_masquerading"]))
+                    out["obfuscation"]["score"] = min(100, int(out["obfuscation"].get("score", 0)) + 20)
+            out["visual"] = visual_data
+        except Exception as e:
+            errors.append(f"visual_error:{e}")
+    
+    # --- Deep Script & Office Analysis ---
+    if opt("deep_script", False) and sfx in (".doc", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".pdf", ".lnk", ".ps1", ".js", ".vbs", ".bat", ".cmd", ".sh"):
+        try:
+            from .office_pdf_lnk import analyze_deep as analyze_office_deep
+            from .source_scripts import analyze_deep as analyze_script_deep
+            
+            script_analysis: Dict[str, Any] = {"deep_enabled": True}
+            
+            if sfx in (".doc", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".pdf", ".lnk"):
+                deep_result = analyze_office_deep(path)
+                script_analysis["office_deep"] = deep_result
+                # Push referenced URLs and external resources to evidence.supply_chain.dependencies
+                deps = deep_result.get("dependencies") or []
+                if deps:
+                    out.setdefault("supply_chain", {}).setdefault("dependencies", []).extend(deps)
+                # Check for stagers
+                if deep_result.get("stagers"):
+                    script_analysis["stagers_detected"] = True
+                    out["obfuscation"]["reasons"] = list(set(out["obfuscation"].get("reasons", []) + ["stager_detected"]))
+                    out["obfuscation"]["score"] = min(100, int(out["obfuscation"].get("score", 0)) + 30)
+            elif sfx in (".ps1", ".js", ".vbs", ".bat", ".cmd", ".sh"):
+                deep_result = analyze_script_deep(path)
+                script_analysis["script_deep"] = deep_result
+                # Check for obfuscation indicators
+                if deep_result.get("obfuscation", {}).get("is_obfuscated"):
+                    out["obfuscation"]["reasons"] = list(set(out["obfuscation"].get("reasons", []) + ["script_obfuscation"]))
+                    out["obfuscation"]["score"] = min(100, int(out["obfuscation"].get("score", 0)) + 25)
+            
+            out["script_analysis"] = script_analysis
+        except Exception as e:
+            errors.append(f"deep_script_error:{e}")
+
     wall_sec = time.perf_counter() - t0
     slowest = "capa" if capa_sec >= die_sec and capa_sec >= yara_sec else ("die" if die_sec >= yara_sec else "yara")
-    out["_timing"] = {"wall_sec": wall_sec, "capa_sec": capa_sec, "die_sec": die_sec, "yara_sec": yara_sec, "slowest": slowest, "aggressive_skip": False}
+    if emulation_sec > capa_sec and emulation_sec > die_sec and emulation_sec > yara_sec:
+        slowest = "emulation"
+    out["_timing"] = {
+        "wall_sec": wall_sec,
+        "capa_sec": capa_sec,
+        "die_sec": die_sec,
+        "yara_sec": yara_sec,
+        "emulation_sec": emulation_sec,
+        "ti_sec": ti_sec,
+        "slowest": slowest,
+        "aggressive_skip": False,
+    }
     return out

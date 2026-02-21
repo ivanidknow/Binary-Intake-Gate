@@ -11,8 +11,8 @@ requires-python = ">=3.10,<3.14"   # включает Python 3.13.7
 license = { file = "LICENSE" }
 authors = [{ name = "Иван" }]
 
-# при необходимости добавь runtime-зависимости сюда
-# dependencies = ["requests>=2.32"]
+# runtime dependencies
+dependencies = ["python-dotenv>=1.0.0"]
 
 [project.scripts]
 bin-gate = "bin_gate.cli:main"

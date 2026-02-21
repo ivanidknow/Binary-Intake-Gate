@@ -1,6 +1,16 @@
 from __future__ import annotations
-import sys, argparse, pathlib, os
+import os
+
+# Load .env at the very first opportunity so VT_API_KEY and others are available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
+import sys, argparse, pathlib
 from typing import List, Tuple, Optional
+
 from .msi_support import collect_targets_with_msi, annotate_evidence, cleanup_tmp_dirs
 from .reporters.markdown import write_markdown_report
 from .policy.loader import load_policy
@@ -668,8 +678,8 @@ def main(argv: list[str] | None = None) -> int:
     p_cve_update = sub.add_parser("cve-update", help="Update Grype vulnerability database (docker pull + db update)")
     p_cve_update.add_argument("--timeout", type=int, default=600, help="Update timeout (s)")
 
-    p_cve_check = sub.add_parser("cve-check", help="Check CVE scanning prerequisites (Docker, Syft, Grype images)")
-    p_cve_check.add_argument("--pull", action="store_true", help="Pull missing images")
+    p_cve_check = sub.add_parser("cve-check", help="Check all container prerequisites (Docker, Syft, Grype, DIE images)")
+    p_cve_check.add_argument("--pull", action="store_true", help="Pull missing images with retry")
 
     p_scan.add_argument("path", help="Path to scan (dir or file)")
     p_scan.add_argument("--policy", default=None, help="Path to policy.yaml (optional)")
@@ -791,6 +801,11 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--die-min-len", type=int, default=4, help="Minimum string length for extraction")
     p_scan.add_argument("--die-max-mb", type=int, default=50, help="Skip DIE if file bigger than N MB (0 = no limit)")
     p_scan.add_argument("--die-no-batch", action="store_true", help="Disable DIE batch mode (run per-file instead)")
+    
+    # Container management
+    p_scan.add_argument("--no-auto-pull", action="store_true",
+                        default=bool(int(os.getenv("BIN_GATE_NO_AUTO_PULL", "0"))),
+                        help="Disable automatic pulling of missing Docker images. Env: BIN_GATE_NO_AUTO_PULL=1")
 
     # CVE (via Docker containers: Syft + Grype)
     p_scan.add_argument("--no-cve", action="store_true", help="Disable CVE scanning (Syft/Grype containers)")
@@ -803,6 +818,9 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--cve-libmap", default=os.getenv("CVE_LIBMAP"),
                         help="[legacy, ignored] Path to lib->package mapping")
     p_scan.add_argument("--cve-timeout", type=int, default=120, help="Docker container timeout (s)")
+    p_scan.add_argument("--cve-update-timeout", type=int, default=600, help="Grype DB update timeout before CVE scan (s). 0 = skip update")
+    p_scan.add_argument("--no-cve-update", action="store_true", help="Skip Grype DB update before CVE scan")
+    p_scan.add_argument("--no-recursive-imports", action="store_true", help="Do not add linked .dll/.so in same dir to analysis queue")
     p_scan.add_argument("--cve-max-per-pkg", type=int, default=20, help="[legacy] Limit advisories per package")
     p_scan.add_argument("--cve-resolve", default=os.getenv("CVE_RESOLVE","auto"),
                         choices=["auto","dpkg","rpm","apk","pacman","none"],
@@ -821,6 +839,49 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--no-obf", action="store_true", help="Disable obfuscation heuristics")
     p_scan.add_argument("--obf-max-mb", type=int, default=50, help="Skip obfuscation analysis for files bigger than N MB (0 = no limit)")
 
+    # -----------------------------------------------------------------------------
+    # Advanced Malware Detection (v0.0.8)
+    # -----------------------------------------------------------------------------
+    
+    # Emulation (Speakeasy)
+    p_scan.add_argument("--emulation", action="store_true",
+                        default=bool(int(os.getenv("BIN_GATE_ENABLE_EMULATION", "0"))),
+                        help="Enable Speakeasy PE emulation (CPU-intensive). Env: BIN_GATE_ENABLE_EMULATION=1")
+    p_scan.add_argument("--no-emulation", action="store_true",
+                        help="Disable emulation even if env enables it")
+    p_scan.add_argument("--emulation-timeout", type=int,
+                        default=int(os.getenv("BIN_GATE_EMULATION_TIMEOUT", "60")),
+                        help="Emulation timeout in seconds. Env: BIN_GATE_EMULATION_TIMEOUT")
+    p_scan.add_argument("--emulation-max-mb", type=int,
+                        default=int(os.getenv("BIN_GATE_EMULATION_MAX_MB", "50")),
+                        help="Skip emulation for files larger than N MB. Env: BIN_GATE_EMULATION_MAX_MB")
+    
+    # Threat Intelligence
+    p_scan.add_argument("--ti", action="store_true",
+                        default=bool(int(os.getenv("BIN_GATE_ENABLE_TI", "0"))),
+                        help="Enable Threat Intelligence (URLHaus, Abuse.ch, DGA). Env: BIN_GATE_ENABLE_TI=1")
+    p_scan.add_argument("--no-ti", action="store_true",
+                        help="Disable threat intelligence even if env enables it")
+    p_scan.add_argument("--ti-timeout", type=int,
+                        default=int(os.getenv("BIN_GATE_TI_TIMEOUT", "30")),
+                        help="TI feed request timeout in seconds. Env: BIN_GATE_TI_TIMEOUT")
+    p_scan.add_argument("--no-dga", action="store_true",
+                        default=bool(int(os.getenv("BIN_GATE_DISABLE_DGA", "0"))),
+                        help="Disable DGA detection. Env: BIN_GATE_DISABLE_DGA=1")
+    
+    # Deep Script & Office Analysis
+    p_scan.add_argument("--deep-script", action="store_true",
+                        default=bool(int(os.getenv("BIN_GATE_ENABLE_DEEP_SCRIPT", "0"))),
+                        help="Enable deep script/office analysis (oletools VBA, LNK parsing). Env: BIN_GATE_ENABLE_DEEP_SCRIPT=1")
+    p_scan.add_argument("--no-deep-script", action="store_true",
+                        help="Disable deep script analysis even if env enables it")
+    
+    # Visual Analysis (PE icons)
+    p_scan.add_argument("--visual", action="store_true",
+                        default=bool(int(os.getenv("BIN_GATE_ENABLE_VISUAL", "1"))),
+                        help="Enable PE icon/resource analysis. Env: BIN_GATE_ENABLE_VISUAL=1")
+    p_scan.add_argument("--no-visual", action="store_true",
+                        help="Disable visual analysis")
 
     parser.add_argument("--avp-scan", action="store_true",
                     help="Запустить AV-проверку Kaspersky (avp.com SCAN)")
@@ -835,6 +896,38 @@ def main(argv: list[str] | None = None) -> int:
     # (только для команд, где этот аргумент определён)
     if hasattr(args, "vt_api_key") and not args.vt_api_key:
         args.vt_api_key = os.getenv("VT_API_KEY") or HARDCODED_VT_API_KEY
+
+    # --- Resolve v0.0.8 Advanced Malware Detection flags (CLI priority over env) ---
+    # Emulation: --no-emulation overrides --emulation and env
+    if hasattr(args, "no_emulation") and args.no_emulation:
+        args.emulation = False
+    # TI: --no-ti overrides --ti and env
+    if hasattr(args, "no_ti") and args.no_ti:
+        args.ti = False
+    # Deep Script: --no-deep-script overrides --deep-script and env
+    if hasattr(args, "no_deep_script") and args.no_deep_script:
+        args.deep_script = False
+    # Visual: --no-visual overrides --visual and env
+    if hasattr(args, "no_visual") and args.no_visual:
+        args.visual = False
+    
+    # VT_API_KEY validation: fail fast with clear message if VT enabled but key missing
+    if hasattr(args, "vt_api_key") and not getattr(args, "no_vt", False):
+        try:
+            from .integrations.virustotal_client import ensure_vt_api_key, ConfigurationError
+            ensure_vt_api_key(getattr(args, "vt_api_key", None))
+            _cli_dbg(f"[vt] API key configured (length={len(getattr(args, 'vt_api_key', '') or '')})")
+        except ConfigurationError as e:
+            print(f"[bin-gate] WARNING: {e}", file=_orig_stdout, flush=True)
+            print("[bin-gate] VirusTotal analysis will be skipped.", file=_orig_stdout, flush=True)
+            args.no_vt = True
+            _cli_dbg("[warning] VT disabled due to missing VT_API_KEY")
+    
+    # TI warning: if enabled but no VT_API_KEY, warn but continue (DGA/local features still work)
+    if hasattr(args, "ti") and args.ti:
+        vt_key = getattr(args, "vt_api_key", None) or os.getenv("VT_API_KEY")
+        if not vt_key:
+            _cli_dbg("[warning] TI enabled but VT_API_KEY not set. Network TI features may be limited. DGA detection will still work.")
 
     # Команда vt-behaviour: на вход только ссылка, парсинг через веб
     if getattr(args, "cmd", None) == "vt-behaviour":
@@ -901,19 +994,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if getattr(args, "cmd", None) == "cve-check":
         from .cve.collector import check_container_prereqs, _pull_image, SYFT_IMAGE, GRYPE_IMAGE
-        print("[bin-gate] Checking CVE scanning prerequisites...", file=_orig_stdout, flush=True)
+        from .docker_utils import DIE_IMAGE, image_exists
+        
+        print("[bin-gate] Checking all container prerequisites...", file=_orig_stdout, flush=True)
         prereqs = check_container_prereqs()
+        die_exists = image_exists(DIE_IMAGE) if prereqs["docker_available"] else False
+        
         print(f"  Docker daemon: {'OK' if prereqs['docker_available'] else 'NOT AVAILABLE'}", file=_orig_stdout, flush=True)
         print(f"  Syft image ({prereqs['syft_image']['image']}): {'OK' if prereqs['syft_image']['exists'] else 'NOT FOUND'}", file=_orig_stdout, flush=True)
         print(f"  Grype image ({prereqs['grype_image']['image']}): {'OK' if prereqs['grype_image']['exists'] else 'NOT FOUND'}", file=_orig_stdout, flush=True)
-        if prereqs["ready"]:
+        print(f"  DIE image ({DIE_IMAGE}): {'OK' if die_exists else 'NOT FOUND'}", file=_orig_stdout, flush=True)
+        
+        all_ready = prereqs["ready"] and die_exists
+        if all_ready:
             print("[bin-gate] All prerequisites OK — ready to scan", file=_orig_stdout, flush=True)
             return 0
         if not prereqs["docker_available"]:
             print("[bin-gate] ERROR: Docker daemon is not running or not installed", file=_orig_stdout, flush=True)
             return 1
         if getattr(args, "pull", False):
-            print("[bin-gate] Pulling missing images...", file=_orig_stdout, flush=True)
+            print("[bin-gate] Pulling missing images (with retry)...", file=_orig_stdout, flush=True)
             if not prereqs["syft_image"]["exists"]:
                 print(f"  Pulling {SYFT_IMAGE}...", file=_orig_stdout, flush=True)
                 ok, err = _pull_image(SYFT_IMAGE)
@@ -922,12 +1022,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Pulling {GRYPE_IMAGE}...", file=_orig_stdout, flush=True)
                 ok, err = _pull_image(GRYPE_IMAGE)
                 print(f"    {'OK' if ok else 'FAILED: ' + err}", file=_orig_stdout, flush=True)
-            # Re-check
+            if not die_exists:
+                print(f"  Pulling {DIE_IMAGE}...", file=_orig_stdout, flush=True)
+                from .docker_utils import pull_image
+                ok, err = pull_image(DIE_IMAGE)
+                print(f"    {'OK' if ok else 'FAILED: ' + err}", file=_orig_stdout, flush=True)
+            # Re-check all
             prereqs = check_container_prereqs()
-            if prereqs["ready"]:
+            die_exists = image_exists(DIE_IMAGE)
+            if prereqs["ready"] and die_exists:
                 print("[bin-gate] All prerequisites OK after pull", file=_orig_stdout, flush=True)
                 return 0
-        print("[bin-gate] Missing images. Run 'bin-gate cve-check --pull' or 'docker pull <image>'", file=_orig_stdout, flush=True)
+        print("[bin-gate] Missing images. Run 'bin-gate cve-check --pull' or manually pull:", file=_orig_stdout, flush=True)
+        if not prereqs.get("syft_image", {}).get("exists"):
+            print(f"  docker pull {SYFT_IMAGE}", file=_orig_stdout, flush=True)
+        if not prereqs.get("grype_image", {}).get("exists"):
+            print(f"  docker pull {GRYPE_IMAGE}", file=_orig_stdout, flush=True)
+        if not die_exists:
+            print(f"  docker pull {DIE_IMAGE}", file=_orig_stdout, flush=True)
         return 1
 
     if args.cmd != "scan":
@@ -942,6 +1054,72 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[bin-gate] CRITICAL: Docker is required but unavailable: {e}", file=sys.stderr)
         print("[bin-gate] Install Docker and ensure daemon is running.", file=sys.stderr)
         return 10  # Hard fail exit code
+
+    # --- AUTOMATIC CONTAINER PREREQUISITES CHECK ---
+    _missing_images: list[str] = []
+    _prereqs_warnings: list[str] = []
+    
+    # Check CVE prerequisites (Syft + Grype) if enabled
+    if not getattr(args, "no_cve", False):
+        from .cve.collector import check_container_prereqs as check_cve_prereqs, SYFT_IMAGE, GRYPE_IMAGE, _pull_image
+        cve_prereqs = check_cve_prereqs()
+        if not cve_prereqs["syft_image"]["exists"]:
+            _missing_images.append(SYFT_IMAGE)
+        if not cve_prereqs["grype_image"]["exists"]:
+            _missing_images.append(GRYPE_IMAGE)
+        if not cve_prereqs["ready"]:
+            _prereqs_warnings.append("CVE scanning (Syft/Grype)")
+    
+    # Check DIE prerequisites if enabled
+    if not getattr(args, "no_die", False):
+        from .docker_utils import DIE_IMAGE
+        die_prereqs = check_die_prereqs()
+        if not die_prereqs["die_image"]["exists"]:
+            _missing_images.append(DIE_IMAGE)
+        if not die_prereqs["ready"]:
+            _prereqs_warnings.append("DIE packer detection")
+    
+    # Report and handle missing images
+    if _missing_images:
+        print(f"[bin-gate] Container prerequisites check: {len(_missing_images)} image(s) missing", file=_orig_stdout, flush=True)
+        for img in _missing_images:
+            print(f"  - {img}", file=_orig_stdout, flush=True)
+        
+        _auto_pull = not getattr(args, "no_auto_pull", False)
+        
+        if _auto_pull:
+            # Auto-pull missing images
+            print("[bin-gate] Auto-pulling missing images...", file=_orig_stdout, flush=True)
+            _pull_failed = []
+            for img in _missing_images:
+                print(f"  Pulling {img}...", file=_orig_stdout, flush=True, end="")
+                try:
+                    from .cve.collector import _pull_image
+                    ok, err = _pull_image(img)
+                    if ok:
+                        print(" OK", file=_orig_stdout, flush=True)
+                    else:
+                        print(f" FAILED: {err}", file=_orig_stdout, flush=True)
+                        _pull_failed.append(img)
+                except Exception as e:
+                    print(f" FAILED: {e}", file=_orig_stdout, flush=True)
+                    _pull_failed.append(img)
+            
+            if _pull_failed:
+                print(f"[bin-gate] WARNING: Failed to pull {len(_pull_failed)} image(s). Some features will be disabled:", file=_orig_stdout, flush=True)
+                for w in _prereqs_warnings:
+                    print(f"  - {w}", file=_orig_stdout, flush=True)
+                print("[bin-gate] Run 'bin-gate cve-check --pull' manually or use --no-cve / --no-die to skip", file=_orig_stdout, flush=True)
+            else:
+                print("[bin-gate] All images pulled successfully", file=_orig_stdout, flush=True)
+        else:
+            # Auto-pull disabled
+            print("[bin-gate] Auto-pull disabled (--no-auto-pull). Some features will be unavailable:", file=_orig_stdout, flush=True)
+            for w in _prereqs_warnings:
+                print(f"  - {w}", file=_orig_stdout, flush=True)
+            print("[bin-gate] Run 'bin-gate cve-check --pull' to pull images manually", file=_orig_stdout, flush=True)
+    else:
+        _cli_dbg("[prereqs] All container prerequisites OK")
 
     root = pathlib.Path(args.path).resolve()
     if not root.exists():
@@ -981,6 +1159,38 @@ def main(argv: list[str] | None = None) -> int:
 
         archive_stats = exp.stats
 
+    # --- Recursive import scanning: add linked .dll/.so in same dir to analysis queue ---
+    if not getattr(args, "no_recursive_imports", False):
+        try:
+            from pathlib import Path as _P
+            from .analyzers.pe_hardening import get_imported_dlls_quick, recursive_import_scanner
+            from .analyzers.elf_deps import list_elf_shared_libs
+            _seen = {str(_P(f).resolve()) for f in files}
+            for fp in list(files):
+                fp = _P(fp) if not isinstance(fp, _P) else fp
+                try:
+                    with fp.open("rb") as _f:
+                        _head = _f.read(4)
+                except Exception:
+                    continue
+                if _head[:2] == b"MZ":
+                    _names = get_imported_dlls_quick(fp)
+                    _kind = "PE"
+                elif len(_head) >= 4 and _head[:4] == b"\x7fELF":
+                    _libs = list_elf_shared_libs(fp)
+                    _names = [x["library"] for x in _libs]
+                    _kind = "ELF"
+                else:
+                    continue
+                for _dep_path, _tag in recursive_import_scanner(fp, _names, _kind):
+                    _key = str(_dep_path)
+                    if _key not in _seen:
+                        _seen.add(_key)
+                        files.append(_dep_path)
+                        origin_of[_key] = [str(fp), _tag]
+        except Exception:
+            pass
+
     cache = Cache(pathlib.Path(args.cache_db)) if args.cache_db else Cache()
     vt_ttl = max(0, int(args.vt_ttl_hours)) * 3600
 
@@ -990,6 +1200,20 @@ def main(argv: list[str] | None = None) -> int:
         _vlog(f"[vt_debug] bin-gate scan started (MITRE filter build) log={get_vt_debug_log_path()}")
     except Exception:
         pass
+
+    # --- CVE DB UPDATE (before any CVE check, same as bin-gate cve-update) ---
+    if not getattr(args, "no_cve", False) and not getattr(args, "no_cve_update", False):
+        _cve_update_timeout = int(getattr(args, "cve_update_timeout", 600))
+        if _cve_update_timeout > 0:
+            from .cve.collector import update_grype_db
+            print("[bin-gate] Updating Grype vulnerability database...", file=_orig_stdout, flush=True)
+            _ok, _msg = update_grype_db(timeout_sec=_cve_update_timeout)
+            if _ok:
+                _cli_dbg("[cve] Grype DB updated successfully")
+                print("[bin-gate] Grype DB updated", file=_orig_stdout, flush=True)
+            else:
+                _cli_dbg(f"[cve] Grype DB update failed (continuing with existing DB): {_msg}")
+                print(f"[bin-gate] Grype DB update failed (continuing): {_msg}", file=_orig_stdout, flush=True)
 
     # --- BATCH CVE SCAN (Syft + Grype один раз для всей директории) ---
     _cve_batch_map: Optional[BatchVulnerabilityMap] = None

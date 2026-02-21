@@ -495,6 +495,7 @@ def analyze_deep(
         "pdf": None,
         "stagers": [],
         "iocs": [],
+        "dependencies": [],  # All referenced URLs and external resources for evidence.supply_chain
         "suspicious": False,
         "risk_score": 0,
         "errors": [],
@@ -516,7 +517,14 @@ def analyze_deep(
             lnk_result = _parse_lnk_file(data)
             result["lnk"] = lnk_result
             result["stagers"] = lnk_result.get("suspicious_patterns", [])
-            
+            # Extract all referenced URLs and paths for supply_chain.dependencies
+            for ref in (lnk_result.get("target_path"), lnk_result.get("working_dir"), lnk_result.get("icon_location")):
+                if ref and isinstance(ref, str) and ref.strip():
+                    result["dependencies"].append({"type": "path", "value": ref.strip()[:500], "source": "lnk"})
+            cmd = lnk_result.get("command_line") or lnk_result.get("arguments") or ""
+            if cmd:
+                for url_match in re.finditer(r"https?://[^\s<>\"'\]]+", cmd):
+                    result["dependencies"].append({"type": "url", "value": url_match.group(0)[:500], "source": "lnk"})
             # Update suspicion
             if lnk_result.get("payloads") or lnk_result.get("suspicious_patterns"):
                 result["suspicious"] = True
@@ -540,13 +548,20 @@ def analyze_deep(
                     
                     result["risk_score"] += vba_result.get("obfuscation_score", 0)
                     
-                    # Collect IOCs
+                    # Collect IOCs and dependencies (URLs / external resources)
                     for ioc in vba_result.get("iocs", []):
                         result["iocs"].append({
                             "type": ioc.get("type"),
                             "value": ioc.get("keyword"),
                             "source": "vba_analysis",
                         })
+                        kw = ioc.get("keyword")
+                        if kw and isinstance(kw, str):
+                            result["dependencies"].append({
+                                "type": ioc.get("type") or "external_resource",
+                                "value": kw[:500],
+                                "source": "vba_analysis",
+                            })
         
         elif sfx == ".pdf":
             pdf_result = _analyze_pdf_javascript(data)
@@ -562,13 +577,16 @@ def analyze_deep(
             if pdf_result.get("suspicious_objects"):
                 result["risk_score"] += len(pdf_result["suspicious_objects"]) * 2
             
-            # Add URLs as IOCs
+            # Add URLs as IOCs and to supply_chain.dependencies
             for url in pdf_result.get("urls", []):
                 result["iocs"].append({
                     "type": "url",
                     "value": url,
                     "source": "pdf_analysis",
                 })
+                result["dependencies"].append({"type": "url", "value": url[:500], "source": "pdf_analysis"})
+            for obj in pdf_result.get("suspicious_objects", []):
+                result["dependencies"].append({"type": "external_resource", "value": obj, "source": "pdf_analysis"})
         
         elif sfx in (".ps1", ".vbs", ".js", ".bat", ".cmd"):
             # Analyze script content for stagers

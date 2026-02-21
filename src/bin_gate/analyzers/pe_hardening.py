@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import platform, json, subprocess, re
 from collections import defaultdict, Counter
 
@@ -326,6 +326,80 @@ def _parse_load_config_extended(pe, lc) -> dict:
         pass
     
     return result
+
+# ---- Recursive import / dependency scanning (for analysis queue) -----------
+
+def get_imported_dlls_quick(path: Path) -> List[str]:
+    """
+    Lightweight PE import scan: returns list of imported DLL names only.
+    Use for dependency discovery without full analyze_pe_hardening.
+    Returns [] on non-PE or error.
+    """
+    try:
+        import pefile  # type: ignore
+    except ImportError:
+        return []
+    dlls: List[str] = []
+    try:
+        with path.open("rb") as f:
+            pe = pefile.PE(data=f.read(), fast_load=True)
+        pe.parse_data_directories(directories=[DIR_IMPORT])
+        for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
+            try:
+                dll_name = entry.dll.decode(errors="ignore") if isinstance(entry.dll, (bytes, bytearray)) else str(entry.dll)
+            except Exception:
+                dll_name = None
+            if dll_name:
+                dlls.append(dll_name)
+        try:
+            pe.parse_data_directories(directories=[DIR_DELAY_IMPORT])
+            for entry in getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []) or []:
+                d_dll = entry.dll.decode(errors="ignore") if isinstance(entry.dll, (bytes, bytearray)) else str(entry.dll)
+                if d_dll:
+                    dlls.append(d_dll)
+        except Exception:
+            pass
+    except Exception:
+        return []
+    return list(dict.fromkeys(dlls))  # preserve order, dedupe
+
+
+def recursive_import_scanner(
+    scanned_file_path: Path,
+    imported_names: List[str],
+    kind: str = "PE",
+) -> List[Tuple[Path, str]]:
+    """
+    Find linked .dll (PE) or .so (ELF) files in the same directory as the scanned file.
+    Returns list of (path, tag) with tag "origin_dependency" for adding to the analysis queue.
+    """
+    if not imported_names:
+        return []
+    same_dir = scanned_file_path.parent
+    if not same_dir.is_dir():
+        return []
+    suffix_lower = ".dll" if kind.upper() == "PE" else ".so"
+    want_set: set = set()
+    for n in imported_names:
+        nlow = n.lower().strip()
+        want_set.add(nlow)
+        if nlow.endswith(suffix_lower):
+            want_set.add(nlow[: -len(suffix_lower)] + suffix_lower)
+        else:
+            want_set.add(nlow + suffix_lower)
+    seen: set = set()
+    out: List[Tuple[Path, str]] = []
+    for child in same_dir.iterdir():
+        if not child.is_file():
+            continue
+        name_lower = child.name.lower()
+        if name_lower in seen:
+            continue
+        if name_lower.endswith(suffix_lower) and name_lower in want_set:
+            seen.add(name_lower)
+            out.append((child.resolve(), "origin_dependency"))
+    return out
+
 
 # ---- main analyzer --------------------------------------------------------
 

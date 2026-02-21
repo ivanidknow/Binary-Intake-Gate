@@ -18,7 +18,7 @@
 
 ### 1. Статический анализ заголовков и структуры
 
-- **PE (Windows):** модуль `pe_hardening.py` — разбор заголовков PE (DllCharacteristics, Optional Header, секции). Проверяются: ASLR (DYNAMIC_BASE), DEP (NX_COMPAT), CFG (GUARD_CF), высокоэнтропийный VA; наличие RWX-секций и overlay; категории импортов (memory, proc_thread, network, registry, debug_sym и т.д.); признаки динамического резолва API (GetProcAddress, LoadLibrary). Подпись Authenticode проверяется через PowerShell `Get-AuthenticodeSignature` (Windows) или разбор Data Directory (DIR_SECURITY).
+- **PE (Windows):** модуль `pe_hardening.py` — разбор заголовков PE (DllCharacteristics, Optional Header, секции). Проверяются: ASLR (DYNAMIC_BASE), DEP (NX_COMPAT), CFG (GUARD_CF), высокоэнтропийный VA; наличие RWX-секций и overlay; категории импортов (memory, proc_thread, network, registry, debug_sym и т.д.); признаки динамического резолва API (GetProcAddress, LoadLibrary). Подпись Authenticode проверяется через PowerShell `Get-AuthenticodeSignature` (Windows) или разбор Data Directory (DIR_SECURITY). **Recursive Import Scanner:** функции `get_imported_dlls_quick(path)` (лёгкое извлечение списка импортируемых DLL) и `recursive_import_scanner(scanned_file_path, imported_names, kind)` — поиск связанных .dll (PE) или .so (ELF) в той же директории для добавления в очередь анализа с тегом `origin_dependency` (управляется из CLI после сбора целей; отключение: `--no-recursive-imports`).
 - **ELF:** модуль `elf_checksec.py` (pyelftools) — PIE (DF_1_PIE / ET_DYN), NX, RELRO (full/partial/none), Canary, RPATH/RUNPATH (в т.ч. небезопасные пути), TEXTREL, RWX-сегменты, Fortify, CET (IBT/SHSTK), stripped, build-id, soname, needed.
 - **Mach-O:** модуль `macho_checksec.py` — проверки защищённости для macOS-бинарников.
 
@@ -78,6 +78,9 @@
 | **Network Activity** | Сетевые соединения (C2 detection) | `emulation.network` |
 | **Shellcode Detection** | Детекция шелл-кода в памяти | `emulation.shellcode.{detected, info}` |
 | **Technique Mapping** | Маппинг API в ATT&CK техники | `emulation.techniques` |
+| **Memory Dump Path** | Путь к .dmp (дамп памяти после эмуляции) для CVE/SBOM | `emulation.memory_dump_path` |
+
+**Memory-aided SBOM:** после успешной эмуляции дамп памяти процесса (image base + mapped pages) записывается во временный `.dmp` файл (`get_memory_dumps()`). Путь сохраняется в `emulation.memory_dump_path`. Оркестратор передаёт в CVE-сканер этот дамп (а не исходный файл), если дамп существует и выполняется одно из условий: включён `--emulation` или в evidence обнаружен **VMProtect** (через DIE или obfuscation.packer_families). При обнаружении VMProtect приоритет анализа CVE всегда отдаётся дампу памяти, когда он доступен — см. раздел «CVE / Orchestrator» ниже.
 
 **CLI флаги:**
 - `--emulation` — включить эмуляцию (по умолчанию выключена, CPU-intensive)
@@ -157,6 +160,7 @@ pip install binary-intake-gate[visual]
 | **LNK Payload Extraction** | Base64/Hex payloads в command line | `script_analysis.lnk.{payloads, decoded_payloads}` |
 | **Stager Detection** | powershell -enc, certutil, mshta, etc. | `script_analysis.stagers` |
 | **PDF JavaScript** | Детекция embedded JS и auto-actions | `script_analysis.pdf.{has_javascript, auto_actions}` |
+| **Supply Chain Dependencies** | URL и внешние ресурсы из LNK/Office/PDF + из Speakeasy (decoded_strings, network, files) | `supply_chain.dependencies` (type, value, source) |
 
 **Обнаруживаемые stagers:**
 - PowerShell encoded commands (`-enc`, `-encodedcommand`)
@@ -258,6 +262,9 @@ pip install binary-intake-gate[oletools]
 | `script.stager_count` | int | Количество обнаруженных stagers |
 | `script.lnk_payloads` | int | Encoded payloads в LNK |
 | `script.obfuscation_score` | int | Уровень обфускации скрипта |
+| `supply_chain.dependencies` | list | URL и внешние ресурсы из LNK/Office/PDF и из Speakeasy (decoded_strings, network, files) — type, value, source |
+
+**VMProtect lockdown (жёсткое правило в движке):** при обнаружении «Protector: VMProtect» в DIE (поле detects) или в obfuscation.packer_families для профиля **prod** решение принудительно **deny**; при высоких детекциях VirusTotal (malicious ≥ 5) — дополнительная причина. Для профиля **dev** при VMProtect выставляется **warn**, если иначе было бы allow.
 
 ### 2. Поиск техник и сигнатур: YARA + DIE (быстрый режим) и capa (глубокий)
 
@@ -302,14 +309,15 @@ ev.capa = {
 
 - **DIE (Detect It Easy):** `die_scanner.py` — контейнеризированное решение для детекции упаковщиков, компиляторов и протекторов через Docker (`horsicq/detectiteasy:latest`).
   > **Note:** DIE заменил устаревший FLOSS (floss_runner.py deprecated, не используется).
+  - **Парсинг вывода diec:** diec выводит перед каждым JSON блоком строку с путём (например `/target/file:`), поэтому разбор идёт не по всему stdout, а по извлечённым JSON-блокам: `_extract_json_blocks()` (balanced braces), `_parse_die_stdout_single()` / `_parse_die_stdout_batch()` с привязкой пути к блоку через `_path_line_before()`.
   - **Batch Mode (по умолчанию):** один вызов `diec -j -r /target` для рекурсивного сканирования всей директории вместо N вызовов на файл.
     - `pre_scan_die(directory)` — выполняется перед основным циклом анализа.
-    - `DieBatchMap` — класс для индексации результатов по путям файлов.
+    - `DieBatchMap` — класс для индексации результатов по путям файлов; разбор вывода через `_parse_die_stdout_batch()`.
     - `get_die_info(path)` — быстрый lookup данных для конкретного файла.
     - **Результат:** 1 Docker-контейнер вместо N, время DIE-этапа сокращается в разы.
-  - **Per-file Mode:** запуск `docker run --rm -v ${FILE}:/target/file:ro horsicq/detectiteasy diec -j /target/file` при `--die-no-batch`.
+  - **Per-file Mode:** запуск `docker run --rm -v ${FILE}:/target/file:ro horsicq/detectiteasy diec -j /target/file` при `--die-no-batch`; парсинг через `_parse_die_stdout_single()`.
   - **Результат:** JSON с детектами (packer/compiler/protector/installer), энтропией по секциям.
-  - **Интеграция:** автоматическое обновление `evidence.die`, `evidence.obfuscation`, `evidence.yara_families` (добавление "packers" при обнаружении).
+  - **Интеграция:** автоматическое обновление `evidence.die`, `evidence.obfuscation`, `evidence.yara_families` (добавление "packers" при обнаружении). Детект «Protector: VMProtect» учитывается движком политик (см. VMProtect lockdown ниже).
   - **Fallback:** при недоступности Docker — встроенный Python-алгоритм извлечения ASCII-строк и базовое определение упаковщиков по сигнатурам в бинарнике.
   - **CLI:** `--no-die` отключает DIE-анализ, `--die-no-batch` отключает batch-режим.
 - **obfuscation.py:** эвристики обфускации: соотношение ASCII/UTF-16 строк к размеру файла, энтропия секций, признаки упаковщиков по именам секций, антиотладочные/анти-VM строки, динамический резолв API, маркеры инъекций (VirtualProtect, WriteProcessMemory, CreateRemoteThread). Результат — единый блок `obfuscation` (reasons, score, packed_suspect, has_dyn_api_resolve и т.д.). DIE-детекты мержатся в этот блок.
@@ -324,8 +332,10 @@ ev.capa = {
   - **In-memory кэш behaviours:** `_behaviours_run_cache` в `virustotal_client.py` — кэш в рамках одного запуска. Гарантирует один GET-запрос `/behaviours` на хэш за всю сессию; повторные вызовы возвращают закэшированные данные без сети.
   - **Rate-limit retry:** при 429 ошибках — до 3 ретраев с backoff (15 * attempt секунд).
 - **CVE/Vulnerability Scanning (Syft + Grype):** `cve/collector.py` — контейнеризированное сканирование через Docker:
+  - **Обновление базы перед сканом:** перед каждым запуском проверки CVE выполняется обновление базы Grype (аналог `bin-gate cve-update`): pull образа при необходимости и `grype db update`. Таймаут задаётся `--cve-update-timeout` (default 600 с); `--no-cve-update` отключает обновление перед сканом.
+  - **Memory-aided SBOM:** оркестратор (`orchestrate.py`) передаёт в `collect_cve_for_file` путь к дампу памяти эмуляции (`emulation.memory_dump_path`), если файл дампа существует и (включён `--emulation` или в evidence обнаружен VMProtect через DIE/obfuscation). При обнаружении VMProtect приоритет CVE-анализа всегда отдаётся дампу, когда он доступен; иначе — исходному файлу. Syft/Grype сканируют распакованное содержимое по дампу, а не обфусцированный бинарник.
   - **Batch Mode (по умолчанию):** один вызов Syft + один вызов Grype для всей директории вместо N вызовов на файл.
-    - `pre_scan_vulnerabilities(directory)` — выполняется перед основным циклом анализа.
+    - `pre_scan_vulnerabilities(directory)` — выполняется перед основным циклом анализа (после обновления базы, если не `--no-cve-update`).
     - `BatchVulnerabilityMap` — класс для индексации результатов по путям файлов.
     - `get_results_for_file(path)` — быстрый lookup уязвимостей для конкретного файла.
     - **Результат:** 2 Docker-контейнера вместо 2×N, время сокращается с минут до 20-40 секунд.
@@ -341,6 +351,8 @@ ev.capa = {
   - **`CRITICAL_LIBRARY_THRESHOLDS`:** словарь с минимальными безопасными версиями для 30+ библиотек (C/C++, Java, Python, JavaScript, Go).
   - **`check_outdated_critical_libraries(components)`:** функция проверки компонентов SBOM против порогов.
   - **Policy Reasons:** при обнаружении критических/high рисков добавляются в `policy_reasons` (например, `supply_chain_risk:openssl<3.0.0`).
+  - **Referenced URLs / External Resources (LNK, Office, PDF):** модуль `office_pdf_lnk.py` в `analyze_deep` извлекает все URL и внешние ссылки (target_path, working_dir, icon_location, URLs из command line для LNK; urls и suspicious_objects для PDF; IOCs из VBA для Office). Они записываются в `evidence.supply_chain.dependencies` как `[{type, value, source}]`; в контексте политики доступны как `ctx.supply_chain.dependencies`.
+  - **Speakeasy (эмуляция):** в `run_one_file.py` после эмуляции в `supply_chain.dependencies` дописываются: URL, извлечённые из `emulation.decoded_strings` (source: `emulation_decoded_strings`); URL из параметров перехваченных сетевых вызовов `emulation.network` (source: `emulation_network`); пути к файлам из `emulation.files` (created/read/written) как `type: "file_ref"` (source: `emulation_files_created` / `_read` / `_written`). Таким образом, dependencies наполняются и из документов (office_pdf_lnk), и из перехвата API в Speakeasy.
   - **Результат в Evidence:**
     ```python
     ev.supply_chain = {
@@ -348,7 +360,8 @@ ev.capa = {
             {"library": "openssl", "current_version": "1.1.1", "min_safe_version": "3.0.0", "risk": "critical", ...}
         ],
         "policy_reasons": ["supply_chain_risk:openssl<3.0.0"],
-        "risk_level": "critical"  # highest risk from any library
+        "risk_level": "critical",  # highest risk from any library
+        "dependencies": [{"type": "url", "value": "https://...", "source": "pdf_analysis"}, {"type": "url", "value": "...", "source": "emulation_decoded_strings"}, {"type": "file_ref", "value": "...", "source": "emulation_files_created"}, ...]
     }
     ```
   - **Пример критических библиотек:**
@@ -411,30 +424,53 @@ ev.capa = {
 | `BIN_GATE_WORKERS` | Количество параллельных воркеров | 4 |
 | `BIN_GATE_PROFILE` | Профиль политики (dev/staging/prod) | dev |
 
+**Advanced Malware Detection (v0.0.8):**
+
+| Переменная | Описание | Default |
+|------------|----------|---------|
+| `BIN_GATE_ENABLE_EMULATION` | Включить Speakeasy эмуляцию PE | 0 |
+| `BIN_GATE_EMULATION_TIMEOUT` | Таймаут эмуляции (секунды) | 60 |
+| `BIN_GATE_EMULATION_MAX_MB` | Макс. размер файла для эмуляции (MB) | 50 |
+| `BIN_GATE_ENABLE_TI` | Включить Threat Intelligence | 0 |
+| `BIN_GATE_TI_TIMEOUT` | Таймаут TI запросов (секунды) | 30 |
+| `BIN_GATE_TI_CACHE_TTL` | TTL кэша TI feeds (часы) | 24 |
+| `BIN_GATE_DISABLE_DGA` | Отключить DGA detection | 0 |
+| `BIN_GATE_ENABLE_DEEP_SCRIPT` | Глубокий анализ скриптов (oletools) | 0 |
+| `BIN_GATE_ENABLE_VISUAL` | Анализ PE иконок/ресурсов | 1 |
+
+**CLI приоритет:** Флаги CLI (напр. `--emulation`) имеют приоритет над env переменными. Флаги `--no-*` (напр. `--no-emulation`) полностью отключают функцию.
+
 Полный список см. в `.env.example`.
 
 ### Архитектура прохождения файла через шлюз (intake)
 
-1. **Вход:** команда `bin-gate scan <path>`; путь — файл или директория. Сбор целей: `collect_targets_with_msi` + `sniff_magic` (магические байты MZ/ELF/Mach-O и расширения из BINARY_EXTS). MSI обрабатываются отдельно (распаковка/листинг), результаты помечаются контейнером. При запуске stdout/stderr перенаправляются в `cli_debug.log`.
+1. **Вход:** команда `bin-gate scan <path>`; путь — файл или директория. Сбор целей: `collect_targets_with_msi` + `sniff_magic` (магические байты MZ/ELF/Mach-O и расширения из BINARY_EXTS). MSI обрабатываются отдельно (распаковка/листинг), результаты помечаются контейнером. После распаковки архивов (если не `--no-archives`) выполняется **Recursive Import Scanning** (если не `--no-recursive-imports`): для каждого PE/ELF из списка целей извлекаются импортируемые DLL/библиотеки (`get_imported_dlls_quick` для PE, `list_elf_shared_libs` для ELF), в той же директории ищутся соответствующие `.dll`/`.so`; найденные пути добавляются в список целей с тегом `origin_dependency` и привязкой к родительскому файлу в `origin_of`. При запуске stdout/stderr перенаправляются в `cli_debug.log`.
 
-2. **Опциональная распаковка архивов:** если не `--no-archives`, для каждого файла, распознанного как архив (`is_potential_archive`), вызывается `ArchiveExpander`. Функция `is_potential_archive` проверяет расширения (ZIPLIKE_EXTS, TARLIKE_EXTS, SEVENZ_EXTS, RAR_EXTS) и магические байты (PK, 7z, Rar!). Распакованные файлы добавляются в список целей с цепочкой происхождения (`origin_chain`). Лимиты: глубина вложенности, макс. число файлов, макс. размер, таймаут на архив.
+2. **Автоматическая проверка контейнеров:** после валидации Docker проверяются необходимые образы:
+   - Если CVE включен (не `--no-cve`): проверяются образы Syft и Grype
+   - Если DIE включен (не `--no-die`): проверяется образ DIE
+   - Недостающие образы автоматически загружаются (если не `--no-auto-pull`)
+   - При ошибке загрузки — предупреждение, но scan продолжается с уменьшенной функциональностью
 
-3. **Pre-scan (Batch Mode):** перед основным циклом выполняются batch-операции для всей директории:
+3. **Опциональная распаковка архивов:** если не `--no-archives`, для каждого файла, распознанного как архив (`is_potential_archive`), вызывается `ArchiveExpander`. Функция `is_potential_archive` проверяет расширения (ZIPLIKE_EXTS, TARLIKE_EXTS, SEVENZ_EXTS, RAR_EXTS) и магические байты (PK, 7z, Rar!). Распакованные файлы добавляются в список целей с цепочкой происхождения (`origin_chain`). Лимиты: глубина вложенности, макс. число файлов, макс. размер, таймаут на архив.
+
+5. **Pre-scan (Batch Mode):** перед основным циклом выполняются batch-операции для всей директории:
+   - **CVE DB update:** при включённом CVE и без `--no-cve-update` вызывается обновление базы Grype (аналог `bin-gate cve-update`; таймаут `--cve-update-timeout`).
    - **Batch CVE:** `pre_scan_vulnerabilities(root)` — один Syft + один Grype для всей директории. Результаты индексируются в `BatchVulnerabilityMap`.
-   - **Batch DIE:** `pre_scan_die(root)` — один `diec -j -r` для рекурсивного сканирования. Результаты индексируются в `DieBatchMap`.
+   - **Batch DIE:** `pre_scan_die(root)` — один `diec -j -r` для рекурсивного сканирования; вывод разбирается через `_parse_die_stdout_batch()`. Результаты индексируются в `DieBatchMap`.
    - Это сокращает количество Docker-контейнеров с 2×N (CVE) + N (DIE) до 3 (один Syft, один Grype, один DIE).
 
-4. **Параллельный анализ файлов:** `orchestrate.py` использует `ProcessPoolExecutor` для CPU-bound операций.
+6. **Параллельный анализ файлов:** `orchestrate.py` использует `ProcessPoolExecutor` для CPU-bound операций.
    - **Workers:** количество воркеров настраивается через `--workers` (default: 4) или env `BIN_GATE_WORKERS`.
    - **Batching:** файлы < 100 KB группируются в батчи по 50 штук для снижения накладных расходов на создание процессов.
    - **Thread-safe logging:** запись в `cli_debug.log` через `_thread_safe_log()` с lock.
    - **Profiling:** топ-10 самых медленных файлов записываются в лог с указанием узкого места (capa/YARA/etc).
 
-5. **Цикл по файлам:** для каждого пути вызывается `sniff_magic` → определение типа (PE, ELF, MACHO, EXT, MANIFEST). Создаётся объект `Evidence` (`new_evidence`), заполняются `meta` (path, name, type, size). К evidence привязывается происхождение (MSI/архив) через `annotate_evidence`.
+7. **Цикл по файлам:** для каждого пути вызывается `sniff_magic` → определение типа (PE, ELF, MACHO, EXT, MANIFEST). Создаётся объект `Evidence` (`new_evidence`), заполняются `meta` (path, name, type, size). К evidence привязывается происхождение (MSI/архив) через `annotate_evidence`.
 
-6. **Обязательные метрики:** хэши (`compute_hashes`), энтропия файла (`file_entropy`). Ошибки пишутся в `evidence.errors`.
+8. **Обязательные метрики:** хэши (`compute_hashes`), энтропия файла (`file_entropy`). Ошибки пишутся в `evidence.errors`.
 
-7. **Ветвление по типу и расширению:**
+9. **Ветвление по типу и расширению:**
    - Python-пакет (wheel/sdist): `analyze_python_pkg` (метаданные, опционально Bandit, RECORD).
    - PE: `analyze_pe_hardening`, энтропия секций.
    - ELF: `analyze_elf_checksec`, энтропия секций.
@@ -443,7 +479,7 @@ ev.capa = {
    - Для PE/ELF: YARA (`run_yara`) → DIE (`run_die`) → техники (`extract_yara_techniques`, `extract_techniques_from_die`) → capa (merged, по умолчанию только YARA+DIE); детекция упаковщиков по YARA (`detect_packers_from_yara`), обфускация (`analyze_obfuscation`), репутация (`run_reputation_scan` при наличии правил). Счётчики DIE/PowerShell/source передаются в YARA как externals.
    - CVE: `collect_cve_for_file` запускает Docker-контейнеры Syft (SBOM) + Grype (vuln scan). Syft автоматически определяет тип файла и зависимости; Grype сканирует на уязвимости. Для архивов передаётся путь к распакованной директории.
 
-8. **VirusTotal:** запросы к VT выполняются **только для исполняемых файлов** (PE/ELF/Mach-O или расширение из `VT_EXECUTABLE_EXTS`). При наличии SHA-256 и без `--no-vt`:
+10. **VirusTotal:** запросы к VT выполняются **только для исполняемых файлов** (PE/ELF/Mach-O или расширение из `VT_EXECUTABLE_EXTS`). При наличии SHA-256 и без `--no-vt`:
    - Фильтрация: `_is_vt_candidate(kind, sfx)` проверяет, что файл — нативный бинарник/инсталлятор.
    - In-memory кэш: `_behaviours_run_cache` гарантирует один GET `/behaviours` на хэш за запуск.
    - SQLite кэш: проверка `cache.get("vt_full", sha256, ttl)`.
@@ -451,11 +487,11 @@ ev.capa = {
    - Поведения нормализуются; при пустых данных — опциональный запрос через Playwright UI.
    - Результат кладётся в кэш, в evidence попадает `vt`.
 
-9. **Политика:** для каждого evidence вызывается `evaluate_policy(ev_dict, policy, profile)`. Движок в `policy/engine.py`: CEL-подобные выражения (when) с безопасным доступом к pe, elf, vt, yara_families, capa_tactics, cve, reputation, obfuscation; правила с score или then: deny/warn. Итог: decision (allow/warn/deny), score, reasons, matched. Результат записывается в `ev_dict["policy"]`.
+11. **Политика:** для каждого evidence вызывается `evaluate_policy(ev_dict, policy, profile)`. Движок в `policy/engine.py`: CEL-подобные выражения (when) с безопасным доступом к pe, elf, vt, die, yara_families, capa_tactics, cve, reputation, obfuscation, supply_chain (в т.ч. dependencies); правила с score или then: deny/warn. После применения правил выполняется **VMProtect lockdown:** при обнаружении «Protector: VMProtect» в DIE (detects) или в obfuscation.packer_families для профиля **prod** решение принудительно **deny** (при высоких детекциях VirusTotal — усиление); для **dev** — **warn**, если иначе было бы allow. Итог: decision (allow/warn/deny), score, reasons, matched. Результат записывается в `ev_dict["policy"]`.
 
-10. **Постобработка:** сверка MF-манифестов с хэшами, проверка OVF references (missing/size_mismatch).
+12. **Постобработка:** сверка MF-манифестов с хэшами, проверка OVF references (missing/size_mismatch).
 
-11. **Выход:** `write_markdown_report` (report.md), опционально `write_human_report` (human_report.md, RU), `write_sarif_report`, GitHub Step Summary и аннотации. Код возврата задаётся флагом `--fail-on` (none/warn/deny).
+13. **Выход:** `write_markdown_report` (report.md), опционально `write_human_report` (human_report.md, RU), `write_sarif_report`, GitHub Step Summary и аннотации. Код возврата задаётся флагом `--fail-on` (none/warn/deny).
 
 ### Ключевые CLI-флаги
 
@@ -467,9 +503,13 @@ ev.capa = {
 - `--no-cve` — отключить CVE-сканирование (Syft/Grype).
 - `--cve-no-batch` — отключить batch-режим CVE (запускать Syft+Grype для каждого файла отдельно).
 - `--cve-timeout` — таймаут Docker-контейнера CVE (по умолчанию 120 сек).
+- `--cve-update-timeout N` — таймаут обновления базы Grype перед CVE-сканом (default 600 с); 0 — не обновлять.
+- `--no-cve-update` — не обновлять базу Grype перед сканом.
+- `--no-recursive-imports` — не добавлять связанные .dll/.so из той же директории в очередь анализа.
 - `--no-die` — отключить DIE-анализ упаковщиков/компиляторов.
 - `--die-timeout` — таймаут Docker-контейнера DIE (по умолчанию 60 сек).
 - `--die-no-batch` — отключить batch-режим DIE (запускать per-file вместо рекурсивного).
+- `--no-auto-pull` — отключить автоматическую загрузку Docker образов. Env: `BIN_GATE_NO_AUTO_PULL=1`
 - `--no-capa` — отключить извлечение техник (YARA+DIE по умолчанию).
 - `--deep-capa` — включить глубокий анализ через capa (медленный, по умолчанию выключен).
 - `--no-parallel` — отключить параллельный анализ (ProcessPoolExecutor).
@@ -478,18 +518,24 @@ ev.capa = {
 - `--profile {dev,staging/prod}` — профиль политики.
 
 **v0.0.8 Advanced Malware Detection:**
-- `--emulation` — включить Speakeasy эмуляцию (CPU-intensive, по умолчанию выключена).
-- `--emulation-timeout N` — таймаут эмуляции в секундах (default: 60).
-- `--ti` — включить Threat Intelligence (URLHaus, Abuse.ch, DGA).
-- `--ti-timeout N` — таймаут TI запросов (default: 30).
-- `--no-dga` — отключить DGA detection.
-- `--deep-script` — включить глубокий анализ скриптов и документов (oletools).
+- `--emulation` — включить Speakeasy эмуляцию (CPU-intensive, по умолчанию выключена). Env: `BIN_GATE_ENABLE_EMULATION=1`
+- `--no-emulation` — отключить эмуляцию (приоритет над env).
+- `--emulation-timeout N` — таймаут эмуляции в секундах (default: 60). Env: `BIN_GATE_EMULATION_TIMEOUT`
+- `--emulation-max-mb N` — макс. размер файла для эмуляции (default: 50 MB). Env: `BIN_GATE_EMULATION_MAX_MB`
+- `--ti` — включить Threat Intelligence (URLHaus, Abuse.ch, DGA). Env: `BIN_GATE_ENABLE_TI=1`
+- `--no-ti` — отключить TI (приоритет над env).
+- `--ti-timeout N` — таймаут TI запросов (default: 30). Env: `BIN_GATE_TI_TIMEOUT`
+- `--no-dga` — отключить DGA detection. Env: `BIN_GATE_DISABLE_DGA=1`
+- `--deep-script` — включить глубокий анализ скриптов и документов (oletools). Env: `BIN_GATE_ENABLE_DEEP_SCRIPT=1`
+- `--no-deep-script` — отключить deep script analysis (приоритет над env).
+- `--visual` — включить анализ PE иконок/ресурсов (по умолчанию включен). Env: `BIN_GATE_ENABLE_VISUAL=1`
+- `--no-visual` — отключить visual analysis.
 
 ### CLI-команды для CVE
 
 - `bin-gate cve-check` — проверка готовности (Docker, образы Syft/Grype).
 - `bin-gate cve-check --pull` — проверка + автоматический pull недостающих образов.
-- `bin-gate cve-update` — обновление базы уязвимостей Grype.
+- `bin-gate cve-update` — обновление базы уязвимостей Grype. То же обновление выполняется автоматически перед каждым CVE-сканом (если не задано `--no-cve-update`).
 
 Центральная структура данных — **Evidence** (dataclass):
 
@@ -509,7 +555,7 @@ ev.capa = {
 | `reputation` | dict | Репутационный анализ |
 | `overlay` | dict | PE overlay анализ (v0.0.7) |
 | `dotnet` | dict | .NET assembly intelligence (v0.0.7) |
-| `supply_chain` | dict | Supply chain risk (v0.0.7) |
+| `supply_chain` | dict | Supply chain risk (v0.0.7); включает `dependencies` (URL/внешние ресурсы из LNK/Office/PDF и из эмуляции Speakeasy) |
 | `hardening_summary` | dict | Агрегированный hardening статус |
 | `policy_reasons` | list | Policy decision audit trail |
 | **`emulation`** | dict | **Speakeasy эмуляция (v0.0.8)** |
@@ -708,4 +754,4 @@ bin-gate scan ./targets --workers 7
 
 ---
 
-Итог: проект описан по фактической реализации; акцент сделан на методиках безопасности (статический анализ, YARA/DIE/capa, подписи, VT, CVE через Syft/Grype, политики, эмуляция, threat intelligence, visual analysis) и на том, как они обеспечивают комплексный анализ бинарников и артефактов в контуре intake/DevSecOps. Версия 0.0.8 расширяет возможности детекции вредоносного ПО: Speakeasy эмуляция, интеграция с threat feeds (URLHaus, Abuse.ch), DGA detection, icon masquerading detection, oletools VBA analysis, robust LNK parsing с payload extraction.
+Итог: проект описан по фактической реализации; акцент сделан на методиках безопасности (статический анализ, YARA/DIE/capa, подписи, VT, CVE через Syft/Grype, политики, эмуляция, threat intelligence, visual analysis) и на том, как они обеспечивают комплексный анализ бинарников и артефактов в контуре intake/DevSecOps. Версия 0.0.8 расширяет возможности детекции вредоносного ПО: Speakeasy эмуляция (в т.ч. дамп памяти для CVE/SBOM по распакованному содержимому), интеграция с threat feeds (URLHaus, Abuse.ch), DGA detection, icon masquerading detection, oletools VBA analysis, robust LNK parsing с payload extraction. Дополнительно: парсинг вывода DIE по JSON-блокам (path + JSON), автоматическое обновление базы Grype перед CVE-сканом, VMProtect lockdown в политике (deny prod / warn dev), рекурсивное добавление связанных .dll/.so в очередь анализа, извлечение URL и внешних ресурсов из LNK/Office/PDF в `supply_chain.dependencies`. При обнаружении VMProtect оркестратор всегда отдаёт приоритет дампу памяти эмуляции для CVE (если дамп есть). Поле `supply_chain.dependencies` наполняется также из Speakeasy: URL из decoded_strings и network, пути к файлам из перехваченных API (files created/read/written).

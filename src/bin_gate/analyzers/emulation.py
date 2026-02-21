@@ -53,6 +53,9 @@ class EmulationResult:
     shellcode_detected: bool = False
     shellcode_info: Dict[str, Any] = field(default_factory=dict)
     
+    # Memory dump path (image base + mapped pages written to .dmp for CVE/SBOM)
+    memory_dump_path: Optional[str] = None
+    
     # Timing
     elapsed_ms: int = 0
     instructions_executed: int = 0
@@ -162,6 +165,48 @@ def _summarize_api_calls(api_calls: List[Dict[str, Any]]) -> Dict[str, int]:
         api_name = call.get("api", "unknown")
         summary[api_name] = summary.get(api_name, 0) + 1
     return dict(sorted(summary.items(), key=lambda x: -x[1])[:50])
+
+
+def _dump_emulated_memory_to_file(se: Any, source_path: Path) -> Optional[str]:
+    """
+    Dump emulated process memory (image base + mapped pages) to a temporary .dmp file.
+    Uses Speakeasy get_memory_dumps() when available.
+    Returns path to the .dmp file or None on failure.
+    """
+    try:
+        get_dumps = getattr(se, "get_memory_dumps", None)
+        if not callable(get_dumps):
+            return None
+        dumps = get_dumps()
+        if not dumps:
+            return None
+        fd, dmp_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                if isinstance(dumps, dict):
+                    for _tag, data in sorted(dumps.items()):
+                        if isinstance(data, (bytes, bytearray)):
+                            f.write(data)
+                elif isinstance(dumps, (list, tuple)):
+                    for item in dumps:
+                        if isinstance(item, (bytes, bytearray)):
+                            f.write(item)
+                        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                            # (base, size, data) or similar
+                            data = item[-1]
+                            if isinstance(data, (bytes, bytearray)):
+                                f.write(data)
+                elif isinstance(dumps, (bytes, bytearray)):
+                    f.write(dumps)
+            return dmp_path
+        except Exception:
+            try:
+                os.unlink(dmp_path)
+            except Exception:
+                pass
+            return None
+    except Exception:
+        return None
 
 
 def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
@@ -282,6 +327,10 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
         
         result.instructions_executed = se.get_instruction_count() if hasattr(se, 'get_instruction_count') else 0
         result.success = True
+
+        # Dump emulated memory (image base + mapped pages) for CVE/SBOM on unpacked content
+        if result.success:
+            result.memory_dump_path = _dump_emulated_memory_to_file(se, path)
         
     except Exception as e:
         result.error = f"speakeasy_error:{str(e)[:200]}"
@@ -391,6 +440,7 @@ def run_emulation(
         "techniques": [],
         "shellcode": {"detected": False, "info": {}},
         "stats": {"elapsed_ms": 0, "instructions": 0},
+        "memory_dump_path": None,
     }
     
     if not enable:
@@ -436,7 +486,9 @@ def run_emulation(
         "elapsed_ms": emu_result.elapsed_ms,
         "instructions": emu_result.instructions_executed,
     }
-    
+    if emu_result.memory_dump_path:
+        result_dict["memory_dump_path"] = emu_result.memory_dump_path
+
     return result_dict
 
 

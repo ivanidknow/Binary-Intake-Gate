@@ -65,6 +65,23 @@ def _build_options(args: Any) -> Dict[str, Any]:
         "die_no_batch": bool(getattr(args, "die_no_batch", False)),
         # Workers
         "workers": int(getattr(args, "workers", DEFAULT_WORKERS)),
+        
+        # --- Advanced Malware Detection (v0.0.8) ---
+        # Emulation (Speakeasy)
+        "emulation": bool(getattr(args, "emulation", False) or int(os.getenv("BIN_GATE_ENABLE_EMULATION", "0"))),
+        "emulation_timeout": int(getattr(args, "emulation_timeout", 0) or int(os.getenv("BIN_GATE_EMULATION_TIMEOUT", "60"))),
+        "emulation_max_mb": int(getattr(args, "emulation_max_mb", 0) or int(os.getenv("BIN_GATE_EMULATION_MAX_MB", "50"))),
+        
+        # Threat Intelligence
+        "ti": bool(getattr(args, "ti", False) or int(os.getenv("BIN_GATE_ENABLE_TI", "0"))),
+        "ti_timeout": int(getattr(args, "ti_timeout", 0) or int(os.getenv("BIN_GATE_TI_TIMEOUT", "30"))),
+        "no_dga": bool(getattr(args, "no_dga", False) or int(os.getenv("BIN_GATE_DISABLE_DGA", "0"))),
+        
+        # Deep Script & Office Analysis
+        "deep_script": bool(getattr(args, "deep_script", False) or int(os.getenv("BIN_GATE_ENABLE_DEEP_SCRIPT", "0"))),
+        
+        # Visual Analysis (PE icons)
+        "visual": bool(getattr(args, "visual", True) and not getattr(args, "no_visual", False)),
     }
 
 
@@ -331,14 +348,39 @@ def run_parallel_scan(
                 path_str = (ev.get("meta") or {}).get("path") or ev.get("path")
                 if not path_str:
                     return ev, None
+                # Prefer emulation memory dump for CVE when: dump exists AND (emulation was on OR VMProtect detected via DIE)
+                scan_path: Optional[Path] = None
+                emu = ev.get("emulation") or {}
+                dump_path = emu.get("memory_dump_path") if isinstance(emu, dict) else None
+                vmprotect = False
+                die = ev.get("die") or {}
+                if isinstance(die, dict):
+                    for d in die.get("detects") or []:
+                        if isinstance(d, str) and "vmprotect" in d.lower():
+                            vmprotect = True
+                            break
+                if not vmprotect:
+                    obf = ev.get("obfuscation") or {}
+                    if isinstance(obf, dict):
+                        packers = obf.get("packer_families") or []
+                        vmprotect = any("vmprotect" in str(p).lower() for p in packers)
+                use_dump = (
+                    dump_path and isinstance(dump_path, str)
+                    and (getattr(args, "emulation", False) or vmprotect)
+                )
+                if use_dump:
+                    dp = Path(dump_path)
+                    if dp.exists():
+                        scan_path = dp
+                if scan_path is None:
+                    scan_path = Path(path_str)
+                if not scan_path.exists():
+                    return ev, None
                 try:
-                    p = Path(path_str)
-                    if not p.exists():
-                        return ev, None
                     inv = getattr(args, "cve_inventory", None)
                     lmap = getattr(args, "cve_libmap", None)
                     cve_doc = collect_cve_for_file(
-                        p,
+                        scan_path,
                         ev,
                         ecosystem=getattr(args, "cve_ecosystem", None),
                         inventory_path=Path(inv).resolve() if inv else None,
