@@ -1266,9 +1266,142 @@ def _elf_ident_flags(ev: dict) -> list[str]:
     if h.get("w_x_segments") is True: flags.append("w+x")
     return flags
 
-def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_files: bool = False):
-    """1) Идентификация и целостность — агрегаты по группам (+ опционально пер-файл)."""
+# Критические CWE для пометки CRITICAL в отчёте (buffer overflows, use-after-free, etc.)
+_CWE_CRITICAL_IDS = frozenset({
+    "CWE-120", "CWE-119", "CWE-787", "CWE-416", "CWE-190", "CWE-476",
+    "CWE-134", "CWE-78", "CWE-89", "CWE-20", "CWE-125", "CWE-415",
+})
+
+
+def _append_cwe_section(lines: list[str], evidences: list) -> None:
+    """Подраздел «Анализ бинарного кода (CWE)» в разделе 4. Критические CWE выводятся с пометкой CRITICAL."""
+    cwe_findings: list[tuple[str, bool]] = []  # (description_or_name, is_critical)
+    for ev in evidences:
+        cwe = _get(ev, "cwe_analysis") or {}
+        if not isinstance(cwe, dict):
+            continue
+        for f in (cwe.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            name = (f.get("name") or f.get("description") or f.get("cwe") or str(f))[:200]
+            raw_cwe = (f.get("cwe") or f.get("id") or "").strip().upper()
+            if not raw_cwe and name:
+                m = re.search(r"CWE[-\s]?\d+", name, re.IGNORECASE)
+                if m:
+                    raw_cwe = m.group(0).replace(" ", "-")
+            cwe_id = raw_cwe
+            if raw_cwe and ":" in raw_cwe:
+                cwe_id = raw_cwe.split(":")[0].strip()
+            is_critical = (cwe_id or "") in _CWE_CRITICAL_IDS
+            display = f"{name} ({cwe_id})" if cwe_id else (name or "—")
+            if is_critical:
+                display = f"**CRITICAL** {display}"
+            cwe_findings.append((display, is_critical))
+    if not cwe_findings:
+        lines.append("— *Анализ бинарного кода (CWE)*: не выполнялся или не выявил проблем.")
+        return
+    lines.append("— *Анализ бинарного кода (CWE)*:")
+    for disp, _ in cwe_findings[:50]:
+        lines.append(f"  • {disp}")
+    if len(cwe_findings) > 50:
+        lines.append(f"  … и ещё {len(cwe_findings) - 50}")
+
+
+def _append_dependency_table(lines: list[str], evidences: list) -> None:
+    """Единая таблица «Зависимости и связанные компоненты». Ключ — имя DLL в нижнем регистре; объединение источников; сортировка по алфавиту; скрытые — жирным."""
+    # Ключ = lowercase имя DLL; значение = { "display_name": str, "in_static": bool, "in_memory": bool }
+    by_key: dict[str, dict] = {}
+    def _add(key: str, display: str, in_static: bool, in_memory: bool) -> None:
+        k = key.lower().strip()
+        if not k:
+            return
+        if k not in by_key:
+            by_key[k] = {"display_name": display.strip(), "in_static": False, "in_memory": False}
+        by_key[k]["in_static"] = by_key[k]["in_static"] or in_static
+        by_key[k]["in_memory"] = by_key[k]["in_memory"] or in_memory
+        # Предпочитаем отображаемое имя с суффиксом .dll
+        if ".dll" in display.lower() and ".dll" not in by_key[k]["display_name"].lower():
+            by_key[k]["display_name"] = display.strip()
+
+    for ev in evidences:
+        for name in (_get(ev, "pe.imported_dlls") or []):
+            if isinstance(name, str) and name.strip():
+                n = name.strip()
+                _add(n, n, True, False)
+        for name in (_get(ev, "emulation.modules") or []):
+            if isinstance(name, str) and name.strip():
+                n = name.strip()
+                _add(n, n, False, True)
+        for d in (_get(ev, "supply_chain.dependencies") or []):
+            if isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value"):
+                val = (d.get("value") or "").strip()
+                if val:
+                    _add(val, val, False, True)
+
+    # Итоговый список: одна запись на DLL (регистронезависимая дедупликация), сортировка по алфавиту
+    rows = list(by_key.values())
+    rows.sort(key=lambda r: (r["display_name"].lower(), r["display_name"]))
+
+    # CVE: для каждой библиотеки число уязвимостей из ev.cve.items
+    lib_vuln_count: dict = {}
+    for ev in evidences:
+        for it in (_get(ev, "cve.items") or []):
+            pkg = (it.get("package") or "").strip().lower()
+            if not pkg:
+                continue
+            vulns = it.get("vulns") or []
+            n = len(vulns) if isinstance(vulns, list) else 0
+            stem = pkg.replace(".dll", "").strip()
+            lib_vuln_count[pkg] = lib_vuln_count.get(pkg, 0) + n
+            if stem and stem != pkg:
+                lib_vuln_count[stem] = lib_vuln_count.get(stem, 0) + n
+
+    # Версия библиотеки из emulation.module_details / detailed_modules (LIEF / отпечаток)
+    lib_version: dict = {}
+    for ev in evidences:
+        for md in (_get(ev, "emulation.module_details") or _get(ev, "emulation.detailed_modules") or []):
+            if isinstance(md, dict) and md.get("name"):
+                n = (md.get("name") or "").strip().lower()
+                v = (md.get("version") or "").strip()
+                if n and v and v != "—":
+                    lib_version[n] = v
+
+    if not rows:
+        return
+    lines.append("*Зависимости и связанные компоненты*:")
+    lines.append("")
+    lines.append("| Библиотека | Источник | Статус CVE |")
+    lines.append("| :--- | :--- | :--- |")
+    for r in rows[:200]:
+        display = r["display_name"].lower()  # единообразный вид (напр. kernel32.dll)
+        in_static = r["in_static"]
+        in_mem = r["in_memory"]
+        if in_static and in_mem:
+            source = "Статика + Память"
+        elif in_mem:
+            source = "Эмуляция (скрыто)"
+        else:
+            source = "Статика (IAT)"
+        base = display.replace(".dll", "").strip() if ".dll" in display else display
+        cnt = max(lib_vuln_count.get(display, 0), lib_vuln_count.get(base, 0))
+        status = str(cnt) if cnt else "Ок"
+        ver = lib_version.get(display) or lib_version.get(base)
+        if ver:
+            status = f"{status} ({ver})" if status != "Ок" else f"Ок ({ver})"
+        # В колонке «Библиотека» выводим версию рядом с именем, если обнаружена (напр. zlib1.dll (v1.2.11))
+        cell_name = f"{display} (v{ver})" if ver else display
+        if source == "Эмуляция (скрыто)":
+            cell_name = f"*{cell_name}*"
+        lines.append(f"| {cell_name} | {source} | {status} |")
+    if len(rows) > 200:
+        lines.append(f"| … и ещё {len(rows) - 200} | — | — |")
+    lines.append("")
+
+
+def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_files: bool = False, evidences: list | None = None):
+    """1) Идентификация и целостность — агрегаты по группам (+ опционально пер-файл). После Метаданные (PE) — таблица зависимостей."""
     lines.append("1) Идентификация и целостность:")
+    dependency_table_appended = False
     for gname, arr in _iter_groups(groups):
         n = len(arr)
         agg = Counter()
@@ -1290,7 +1423,6 @@ def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_fil
         if total_pe > 0:
             parts.append(f"sig={signed}/{total_pe}")
         lines.append(f"* {gname}: {n} файл(ов)" + (", " + "; ".join(parts) if parts else ", критичных отклонений не выявлено"))
-        # === НОВОЕ: подробности по каждому файлу внутри группы ===
         if show_files:
             for pf in arr:
                 ev   = pf["ev"]
@@ -1302,13 +1434,12 @@ def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_fil
                     lines.append(_pe_sections_line(ev))
                     lines.append(_pe_signature_line(ev))
                     lines.append(_pe_meta_line(ev))
-                    imp = _pe_imports_line(ev)
-                    if imp:
-                        lines.append(imp)
+                    if evidences and not dependency_table_appended:
+                        _append_dependency_table(lines, evidences)
+                        dependency_table_appended = True
                 elif kind == "ELF":
                     lines.append(_elf_details_line(ev))
 
-                # Используем _errors_line для фильтрации traceback'ов
                 eline = _errors_line(ev)
                 if eline:
                     lines.append(eline)
@@ -2029,7 +2160,7 @@ def _floss_line(ev: Dict[str, Any]) -> str:
     static  = int(ss.get("static_cnt")  or 0)
     tight   = ss.get("tight_cnt")
     if total == 0:
-        return "FLOSS: строк не извлечено"
+        return ""  # FLOSS не используется — не выводить строку «строк не извлечено»
 
     head = f"FLOSS: decoded {decoded}, stack {stack}, static {static}"
     if tight is not None:
@@ -2288,7 +2419,6 @@ def _pe_meta_line(ev: Dict[str, Any]) -> str:
     subsys = _get(ev, "pe.subsystem") or "—"
     imp_cnt = _get(ev, "pe.imports_count")
     exp_cnt = _get(ev, "pe.exports_count")
-    dlls = _get(ev, "pe.imported_dlls") or []
     rh = _get(ev, "pe.rich_header", {}) or {}
     dotnet = _get(ev, "pe.dotnet.present")
     uac = _get(ev, "pe.resources.uac_level")
@@ -2297,7 +2427,6 @@ def _pe_meta_line(ev: Dict[str, Any]) -> str:
         f"Arch={arch}", f"Subsystem={subsys}",
         f"Imports={imp_cnt if imp_cnt is not None else '—'}",
         f"Exports={exp_cnt if exp_cnt is not None else '—'}",
-        "DLLs=" + _short_list(dlls, 3),
         f".NET={_bool(dotnet)}",
         f"UAC={uac or '—'}",
         f"FileVersion={ver or '—'}",
@@ -2733,12 +2862,27 @@ def write_human_report(
                 "medium":   int(s.get("medium") or 0),
             })
         lines.append(f" * CVE (суммарно): critical={cve_tot['critical']}, high={cve_tot['high']}, medium={cve_tot['medium']}")
+        emu_dlls_compact = []
+        for pf in per_file:
+            for d in (G(pf["ev"], "supply_chain.dependencies") or []):
+                if isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value"):
+                    v = (d.get("value") or "").strip()
+                    if v and v not in emu_dlls_compact:
+                        emu_dlls_compact.append(v)
+        if emu_dlls_compact:
+            lines.append(f" * Обнаружено в памяти (Dynamic Load): {len(emu_dlls_compact)} DLL")
         if rep_sum:
             lines.append(" * Reputation (суммарно): " + ", ".join(f"{k}={v}" for k, v in rep_sum.most_common()))
 
         lines.append("ВЫВОД((/)):")
         if pol_worst == "deny":
             lines.append("Проверяемый пакет отклонён, обнаружил критичные проблемы.")
+            if emu_dlls_compact and any(
+                "vmprotect" in str(G(pf["ev"], "die.detects")).lower() or
+                any("vmprotect" in str(p).lower() for p in (G(pf["ev"], "obfuscation.packer_families") or []))
+                for pf in per_file
+            ):
+                lines.append("Вердикт DENY вызван в том числе наличием VMProtect и скрытых библиотек, выявленных при эмуляции.")
         elif pol_worst == "warn":
             lines.append("Проверяемый пакет одобрен с предупреждениями.")
         else:
@@ -2766,7 +2910,7 @@ def write_human_report(
     
     _append_ovf_section(lines, evidences)  # новый правильный блок (состав, сводка, строгий чек-лист, MF)
     # далее — общая идентификация групп (PE/ELF и пр.)
-    _append_ident_section(lines, groups=groups, show_files=(not compact))
+    _append_ident_section(lines, groups=groups, show_files=(not compact), evidences=evidences)
 
     try:
         lines.append(_ident_human_paragraph(evidences))
@@ -2782,23 +2926,37 @@ def write_human_report(
     _append_static_section(lines, groups=groups, show_files=(not compact))
 
 
-    # 4) Уязвимости зависимостей (агрегат)
+    # 4) Уязвимости зависимостей — только текст: не выявлены или список найденных CVE
     lines.append("4) *Уязвимости зависимостей*:")
     cve_tot = Counter(critical=0, high=0, medium=0)
+    cve_ids: list = []
     for pf in per_file:
-        s = G(pf["ev"], "cve.summary", {}) or {}
+        ev = pf["ev"]
+        s = G(ev, "cve.summary", {}) or {}
         cve_tot.update({
             "critical": int(s.get("critical") or 0),
             "high":     int(s.get("high") or 0),
             "medium":   int(s.get("medium") or 0),
         })
+        for it in (G(ev, "cve.items") or []):
+            for v in (it.get("vulns") or []):
+                vid = v.get("id") or v.get("vuln_id") or str(v)[:50]
+                sev = (v.get("severity") or v.get("severity_level") or "").upper()
+                if vid and vid not in cve_ids:
+                    cve_ids.append((vid, sev))
     if cve_tot["critical"] == 0 and cve_tot["high"] == 0 and cve_tot["medium"] == 0:
         lines.append("— CVE: не выявлены.")
     else:
         lines.append(f"— CVE суммарно: critical={cve_tot['critical']}, high={cve_tot['high']}, medium={cve_tot['medium']}.")
+        if cve_ids:
+            short = [f"{vid} ({sev})" for vid, sev in cve_ids[:30]]
+            lines.append("— Найдено: " + ", ".join(short) + (" …" if len(cve_ids) > 30 else ""))
+
+    # 4) Анализ бинарного кода (CWE) — результаты cwe_checker по дампу эмуляции
+    _append_cwe_section(lines, evidences)
+
     lines.append("")
 
-    
     lines.append("5) *Проверка антивирусом KES:*")
     _append_av_section(lines, evidences, summary)
 
@@ -2808,6 +2966,26 @@ def write_human_report(
     pol_worst, _, _, _ = _worst_decision([pf["ev"] for pf in per_file])
     if pol_worst == "deny":
         lines.append("Файлы отклонены к использованию.")
+        # Если DENY связан с VMProtect и скрытыми библиотеками из эмуляции — указать в обосновании
+        has_vmprotect = False
+        has_emulation_libs = False
+        for ev in (pf["ev"] for pf in per_file):
+            die = ev.get("die") or {}
+            obf = ev.get("obfuscation") or {}
+            for d in (die.get("detects") or []):
+                if isinstance(d, (str, dict)) and "vmprotect" in str(d).lower():
+                    has_vmprotect = True
+                    break
+            if not has_vmprotect and (obf.get("packer_families") or []):
+                if any("vmprotect" in str(p).lower() for p in obf.get("packer_families") or []):
+                    has_vmprotect = True
+            deps = (ev.get("supply_chain") or {}).get("dependencies") or []
+            if any(isinstance(x, dict) and x.get("type") == "dynamic_lib" for x in deps):
+                has_emulation_libs = True
+            if has_vmprotect and has_emulation_libs:
+                break
+        if has_vmprotect and has_emulation_libs:
+            lines.append("Вердикт DENY вызван в том числе наличием VMProtect и скрытых библиотек, выявленных при эмуляции.")
     elif pol_worst == "warn":
         # Если хочешь всегда без «с предупреждениями», меняй эту ветку на одобрено.
         lines.append("Файлы одобрены к использованию с предупреждениями.")

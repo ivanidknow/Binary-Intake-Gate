@@ -49,7 +49,7 @@ from .analyzers.macho_checksec import analyze as analyze_macho_checksec
 from .reporters.sarif import write_sarif_report
 from .reporters.github_checks import write_step_summary, emit_workflow_commands
 from .reporters.human import write_human_report
-from .cve.collector import collect_cve_for_file, pre_scan_vulnerabilities, get_batch_results_for_file, is_batch_scan_ready, BatchVulnerabilityMap
+from .cve.collector import collect_cve_for_file, pre_scan_vulnerabilities, get_batch_results_for_file, get_batch_vulnerability_map, is_batch_scan_ready, BatchVulnerabilityMap
 from .analyzers.obfuscation import analyze_obfuscation
 from .analyzers.packers_detect import detect_packers_from_yara
 from .analyzers.die_scanner import (
@@ -681,6 +681,9 @@ def main(argv: list[str] | None = None) -> int:
     p_cve_check = sub.add_parser("cve-check", help="Check all container prerequisites (Docker, Syft, Grype, DIE images)")
     p_cve_check.add_argument("--pull", action="store_true", help="Pull missing images with retry")
 
+    p_emulation_build = sub.add_parser("emulation-build", help="Build Docker image for Speakeasy emulation (use when local Speakeasy fails on Windows)")
+    p_emulation_build.add_argument("--no-docker", action="store_true", help="Skip Docker check (build only)")
+
     p_scan.add_argument("path", help="Path to scan (dir or file)")
     p_scan.add_argument("--policy", default=None, help="Path to policy.yaml (optional)")
     p_scan.add_argument("--out", default="report.md", help="Output Markdown report path")
@@ -780,7 +783,8 @@ def main(argv: list[str] | None = None) -> int:
     # profile + human + reporters
     p_scan.add_argument("--profile", choices=["dev","staging","prod"], default=os.getenv("BIN_GATE_PROFILE","dev"),
                         help="Policy profile (dev/staging/prod). Env: BIN_GATE_PROFILE")
-    p_scan.add_argument("--human-out", default=None, help="Path to human-friendly report (Markdown, RU)")
+    p_scan.add_argument("--human-out", default=None,
+                        help="Path to human-friendly report (Markdown, RU). Default: BIN_GATE_HUMAN_OUT_DEFAULT env (CLI overrides env)")
     p_scan.add_argument("--sarif-out", default=None, help="Write SARIF v2.1.0 report to this path (e.g., sarif.json)")
     p_scan.add_argument("--gh-summary", action="store_true", help="Append a summary to $GITHUB_STEP_SUMMARY (GitHub Actions)")
     p_scan.add_argument("--gh-annotations", action="store_true", help="Emit ::warning/::error annotations for GitHub Actions")
@@ -818,8 +822,8 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--cve-libmap", default=os.getenv("CVE_LIBMAP"),
                         help="[legacy, ignored] Path to lib->package mapping")
     p_scan.add_argument("--cve-timeout", type=int, default=120, help="Docker container timeout (s)")
-    p_scan.add_argument("--cve-update-timeout", type=int, default=600, help="Grype DB update timeout before CVE scan (s). 0 = skip update")
-    p_scan.add_argument("--no-cve-update", action="store_true", help="Skip Grype DB update before CVE scan")
+    p_scan.add_argument("--cve-update-timeout", type=int, default=0, help="Grype DB update timeout before CVE scan (s). 0 = skip update (default)")
+    p_scan.add_argument("--no-cve-update", action="store_true", help="Skip Grype DB update before CVE scan (default: update disabled)")
     p_scan.add_argument("--no-recursive-imports", action="store_true", help="Do not add linked .dll/.so in same dir to analysis queue")
     p_scan.add_argument("--cve-max-per-pkg", type=int, default=20, help="[legacy] Limit advisories per package")
     p_scan.add_argument("--cve-resolve", default=os.getenv("CVE_RESOLVE","auto"),
@@ -991,6 +995,19 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"[bin-gate] FAILED: {msg}", file=_orig_stdout, flush=True)
             return 1
+
+    if getattr(args, "cmd", None) == "emulation-build":
+        from .docker_utils import check_docker_available, build_emulation_image, EMULATION_IMAGE
+        if not getattr(args, "no_docker", False) and not check_docker_available(raise_on_fail=False).available:
+            print("[bin-gate] ERROR: Docker daemon is not available", file=_orig_stdout, flush=True)
+            return 1
+        print(f"[bin-gate] Building emulation image {EMULATION_IMAGE}...", file=_orig_stdout, flush=True)
+        ok, err = build_emulation_image()
+        if ok:
+            print(f"[bin-gate] SUCCESS: image {EMULATION_IMAGE} built", file=_orig_stdout, flush=True)
+            return 0
+        print(f"[bin-gate] FAILED: {err}", file=_orig_stdout, flush=True)
+        return 1
 
     if getattr(args, "cmd", None) == "cve-check":
         from .cve.collector import check_container_prereqs, _pull_image, SYFT_IMAGE, GRYPE_IMAGE
@@ -1201,26 +1218,29 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
-    # --- CVE DB UPDATE (before any CVE check, same as bin-gate cve-update) ---
-    if not getattr(args, "no_cve", False) and not getattr(args, "no_cve_update", False):
-        _cve_update_timeout = int(getattr(args, "cve_update_timeout", 600))
-        if _cve_update_timeout > 0:
-            from .cve.collector import update_grype_db
-            print("[bin-gate] Updating Grype vulnerability database...", file=_orig_stdout, flush=True)
-            _ok, _msg = update_grype_db(timeout_sec=_cve_update_timeout)
-            if _ok:
-                _cli_dbg("[cve] Grype DB updated successfully")
-                print("[bin-gate] Grype DB updated", file=_orig_stdout, flush=True)
-            else:
-                _cli_dbg(f"[cve] Grype DB update failed (continuing with existing DB): {_msg}")
-                print(f"[bin-gate] Grype DB update failed (continuing): {_msg}", file=_orig_stdout, flush=True)
+    # --- CVE DB UPDATE: по умолчанию не обновляем — работаем с текущей базой; обновление только при --cve-update-timeout > 0 ---
+    _cve_update_timeout = int(getattr(args, "cve_update_timeout", 0))
+    if not getattr(args, "no_cve", False) and _cve_update_timeout > 0:
+        from .cve.collector import update_grype_db
+        print("[bin-gate] Updating Grype vulnerability database...", file=_orig_stdout, flush=True)
+        _ok, _msg = update_grype_db(timeout_sec=_cve_update_timeout)
+        if _ok:
+            _cli_dbg("[cve] Grype DB updated successfully")
+            print("[bin-gate] Grype DB updated", file=_orig_stdout, flush=True)
+        else:
+            _cli_dbg(f"[cve] Grype DB update failed (continuing with existing DB): {_msg}")
+            print(f"[bin-gate] Grype DB update failed (continuing): {_msg}", file=_orig_stdout, flush=True)
 
-    # --- BATCH CVE SCAN (Syft + Grype один раз для всей директории) ---
+    # --- BATCH CVE SCAN (Syft + Grype) ---
+    # Sequential: run batch CVE *after* DIE and emulation (so dumps exist; for VMProtect we then run Syft on dump).
+    # Parallel: pre_scan_vulnerabilities runs inside run_parallel_scan after emulation.
     _cve_batch_map: Optional[BatchVulnerabilityMap] = None
     _cve_batch_error: str = ""
     _cve_use_batch: bool = not getattr(args, "cve_no_batch", False)
-    
-    if not args.no_cve and _cve_use_batch:
+    use_parallel = getattr(args, "parallel", True) and not getattr(sys, "frozen", False)
+    _run_batch_cve_before_parallel: bool = use_parallel  # only run batch CVE at start when parallel; sequential runs it after emulation
+
+    if not args.no_cve and _cve_use_batch and _run_batch_cve_before_parallel:
         _cli_dbg("[cve] Starting batch CVE scan with Syft+Grype...")
         try:
             import time as _cve_time
@@ -1293,7 +1313,12 @@ def main(argv: list[str] | None = None) -> int:
             cache,
             vt_ttl,
             evidence_ttl_sec=vt_ttl,
+            cli_dbg=_cli_dbg,
+            root=root,
+            cve_use_batch=_cve_use_batch,
         )
+        if _cve_use_batch:
+            _cve_batch_map = get_batch_vulnerability_map() or _cve_batch_map
         for ev in evidences:
             ev.setdefault("meta", {})["profile"] = args.profile
             try:
@@ -1414,7 +1439,12 @@ def main(argv: list[str] | None = None) -> int:
                         # CVE из batch-скана (Syft+Grype) или per-file при --cve-no-batch
                         if not args.no_cve:
                             try:
-                                if _cve_use_batch and _cve_batch_map and _cve_batch_map.is_ready:
+                                _fp_path = Path(fp) if fp else Path()
+                                _is_dmp = _fp_path.suffix.lower() == ".dmp"
+                                if _is_dmp:
+                                    _ev_d = ev if isinstance(ev, dict) else getattr(ev, "__dict__", {})
+                                    cve_doc = collect_cve_for_file(_fp_path, _ev_d)
+                                elif _cve_use_batch and _cve_batch_map and _cve_batch_map.is_ready:
                                     cve_doc = _cve_batch_map.get_results_for_file(fp)
                                 elif _cve_use_batch and _cve_batch_error:
                                     cve_doc = {"summary": {}, "items": [], "notes": [f"cve_batch_failed:{_cve_batch_error}"]}
@@ -1719,6 +1749,73 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as e:
                     ev.errors.append(f"obf_error:{e}")
 
+            # --- Emulation (Speakeasy) для VMProtect: принудительно при обнаружении DIE/obfuscation (sequential path) ---
+            _has_vmprotect_seq = False
+            die_seq = getattr(ev, "die", None) or (ev.get("die") if isinstance(ev, dict) else None)
+            if die_seq and isinstance(die_seq, dict):
+                for d in (die_seq.get("detects") or []):
+                    if isinstance(d, dict) and "vmprotect" in (d.get("name") or d.get("sName") or "").lower():
+                        _has_vmprotect_seq = True
+                        break
+            if not _has_vmprotect_seq:
+                obf_seq = getattr(ev, "obfuscation", None) or (ev.get("obfuscation") if isinstance(ev, dict) else {})
+                if isinstance(obf_seq, dict):
+                    _has_vmprotect_seq = any("vmprotect" in str(p).lower() for p in (obf_seq.get("packer_families") or []))
+            if _has_vmprotect_seq and kind == "PE":
+                emu_existing = getattr(ev, "emulation", None) or (ev.get("emulation") if isinstance(ev, dict) else None)
+                dump_path = (emu_existing or {}).get("memory_dump_path") if isinstance(emu_existing, dict) else None
+                if not dump_path or not pathlib.Path(dump_path).exists():
+                    try:
+                        _cli_dbg(f"[emu_dbg] VMProtect: starting emulation for {fp}")
+                        try:
+                            with open("cli_debug.log", "a", encoding="utf-8") as _ef:
+                                _ef.write(f"[emu_dbg] VMProtect: starting emulation for {fp}\n")
+                        except Exception:
+                            pass
+                        from .analyzers.emulation import run_emulation, get_last_dump_reason
+                        emu_timeout = int(getattr(args, "emulation_timeout", 0) or 60)
+                        emu_result = run_emulation(pathlib.Path(fp), timeout=emu_timeout, enable=True, file_type="PE")
+                        if emu_result:
+                            if hasattr(ev, "emulation"):
+                                ev.emulation = emu_result
+                            elif isinstance(ev, dict):
+                                ev["emulation"] = emu_result
+                            dump_path = (emu_result or {}).get("memory_dump_path")
+                            if dump_path and pathlib.Path(dump_path).exists():
+                                _cli_dbg(f"[emu_dbg] VMProtect: emulation done, dump={dump_path}")
+                                try:
+                                    with open("cli_debug.log", "a", encoding="utf-8") as _ef:
+                                        _ef.write(f"[emu_dbg] VMProtect: emulation done, dump={dump_path}\n")
+                                except Exception:
+                                    pass
+                            else:
+                                # Reason is in result dict (works from same process and from workers)
+                                reason = (emu_result or {}).get("dump_failure_reason") or get_last_dump_reason()
+                                if not reason:
+                                    reason = "unknown (emulation module did not set dump_failure_reason; rebuild or run from source)"
+                                msg = f"[emu_dbg] VMProtect: emulation done, no dump path. reason={reason}"
+                                _cli_dbg(msg)
+                                try:
+                                    with open("cli_debug.log", "a", encoding="utf-8") as _ef:
+                                        _ef.write(msg + "\n")
+                                except Exception:
+                                    pass
+                        else:
+                            _cli_dbg("[emu_dbg] VMProtect: emulation returned empty")
+                            try:
+                                with open("cli_debug.log", "a", encoding="utf-8") as _ef:
+                                    _ef.write("[emu_dbg] VMProtect: emulation returned empty\n")
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        ev.errors.append(f"emulation_error:{e}")
+                        _cli_dbg(f"[emu_dbg] VMProtect: emulation failed: {e}")
+                        try:
+                            with open("cli_debug.log", "a", encoding="utf-8") as _ef:
+                                _ef.write(f"[emu_dbg] VMProtect: emulation failed: {e}\n")
+                        except Exception:
+                            pass
+
             # --- Сбор техник ATT&CK из YARA и DIE (замена тяжёлого capa) ---
             if not args.no_capa and kind in ("PE", "ELF"):
                 try:
@@ -1777,20 +1874,27 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as e:
                     ev.errors.append(f"reputation_error:{e}")
 
-            # --- CVE из batch-скана (Syft+Grype) или per-file при --cve-no-batch ---
-            if (not args.no_cve):
+            # --- CVE: в sequential при batch откладываем до после цикла (после эмуляции); иначе per-file или batch из параллели
+            if (not args.no_cve) and not (_cve_use_batch and not use_parallel):
                 try:
-                    # Используем batch результаты вместо индивидуальных запусков Docker
-                    if _cve_use_batch and _cve_batch_map and _cve_batch_map.is_ready:
+                    _is_dmp = Path(fp).suffix.lower() == ".dmp" if fp else False
+                    if _is_dmp:
+                        _ev_d = ev if isinstance(ev, dict) else getattr(ev, "__dict__", {})
+                        cve_doc = collect_cve_for_file(Path(fp), _ev_d)
+                    elif _cve_use_batch and _cve_batch_map and _cve_batch_map.is_ready:
                         cve_doc = _cve_batch_map.get_results_for_file(Path(fp))
                     elif _cve_use_batch and _cve_batch_error:
                         cve_doc = {"summary": {}, "items": [], "notes": [f"cve_batch_failed:{_cve_batch_error}"]}
                     elif _cve_use_batch:
                         cve_doc = get_batch_results_for_file(Path(fp))
                     else:
-                        # Per-file mode (--cve-no-batch)
-                        cve_doc = collect_cve_for_file(Path(fp))
-                    
+                        # Per-file: при наличии дампа эмуляции сканируем дамп (Syft+Grype по распакованному образу)
+                        dump_path = (getattr(ev, "emulation", None) or (ev.get("emulation") if isinstance(ev, dict) else None) or {}).get("memory_dump_path")
+                        if dump_path and pathlib.Path(dump_path).exists():
+                            ev_dict = ev if isinstance(ev, dict) else {"emulation": getattr(ev, "emulation", None), "path": getattr(ev, "path", None), "file": getattr(ev, "file", None)}
+                            cve_doc = collect_cve_for_file(pathlib.Path(dump_path), ev_dict)
+                        else:
+                            cve_doc = collect_cve_for_file(Path(fp))
                     if cve_doc:
                         ev.cve = {
                             "summary": cve_doc.get("summary", {}),
@@ -1798,7 +1902,7 @@ def main(argv: list[str] | None = None) -> int:
                             "batch_mode": cve_doc.get("batch_mode", _cve_use_batch),
                         }
                         for note in cve_doc.get("notes", []) or []:
-                            if "no_vulns_for_file" not in note:  # Не засоряем лог штатными сообщениями
+                            if "no_vulns_for_file" not in note:
                                 ev.errors.append(f"cve_note:{note}")
                 except Exception as e:
                     ev.errors.append(f"cve_error:{e}")
@@ -2221,6 +2325,58 @@ def main(argv: list[str] | None = None) -> int:
         ev_dict["policy"] = polres
         evidences.append(ev_dict)
 
+    # Sequential + batch CVE: pre_scan_vulnerabilities and collect_cve_for_file run STRICTLY AFTER
+    # emulation has completed and dump is confirmed on disk (no CVE before dumps exist).
+    if not use_parallel and not args.no_cve and _cve_use_batch:
+        _cve_batch_error = None
+        _cve_batch_map = None
+        _cli_dbg("[cve] CVE run strictly after emulation (dumps confirmed on disk). Starting batch Syft+Grype...")
+        try:
+            import time as _cve_time
+            _cve_start = _cve_time.perf_counter()
+            cve_batch_ok, cve_batch_err, _cve_batch_map = pre_scan_vulnerabilities(root)
+            _cve_elapsed = _cve_time.perf_counter() - _cve_start
+            if cve_batch_ok and _cve_batch_map and _cve_batch_map.is_ready:
+                _s = _cve_batch_map._scan_result.summary if _cve_batch_map._scan_result else {}
+                _cli_dbg(f"[cve] Batch CVE scan complete in {_cve_elapsed:.1f}s: total={_s.get('total',0)} crit={_s.get('critical',0)} high={_s.get('high',0)}")
+            else:
+                _cve_batch_error = cve_batch_err or "batch_not_ready"
+                _cli_dbg(f"[cve] Batch CVE failed or not ready after {_cve_elapsed:.1f}s: {_cve_batch_error}")
+        except Exception as e:
+            _cve_batch_error = str(e)
+            _cli_dbg(f"[cve] Batch CVE exception: {e}")
+        def _ev_has_vmprotect(e: dict) -> bool:
+            die = e.get("die") or {}
+            for d in (die.get("detects") or []):
+                if isinstance(d, str) and "vmprotect" in d.lower():
+                    return True
+                if isinstance(d, dict) and "vmprotect" in (d.get("name") or d.get("sName") or "").lower():
+                    return True
+            obf = e.get("obfuscation") or {}
+            return any("vmprotect" in str(p).lower() for p in (obf.get("packer_families") or []))
+        for ev in evidences:
+            fp = ev.get("path") or ev.get("file") or ""
+            dump_path = (ev.get("emulation") or {}).get("memory_dump_path")
+            # VMProtect: always use individual collect_cve_for_file (no batch) so dump/synthetic SBOM is used
+            if _ev_has_vmprotect(ev):
+                path_for_cve = pathlib.Path(dump_path) if (dump_path and pathlib.Path(dump_path).exists()) else pathlib.Path(fp)
+                cve_doc = collect_cve_for_file(path_for_cve, ev)
+            elif dump_path and pathlib.Path(dump_path).exists():
+                cve_doc = collect_cve_for_file(pathlib.Path(dump_path), ev)
+            elif pathlib.Path(fp).suffix.lower() == ".dmp":
+                cve_doc = collect_cve_for_file(pathlib.Path(fp), ev)
+            elif _cve_batch_map and _cve_batch_map.is_ready:
+                cve_doc = _cve_batch_map.get_results_for_file(pathlib.Path(fp))
+            else:
+                cve_doc = {"summary": {}, "items": [], "notes": [f"cve_batch_failed:{_cve_batch_error}"]} if _cve_batch_error else get_batch_results_for_file(pathlib.Path(fp))
+            if cve_doc:
+                used_individual = _ev_has_vmprotect(ev) or (dump_path and pathlib.Path(dump_path).exists())
+                ev["cve"] = {
+                    "summary": cve_doc.get("summary", {}),
+                    "items": cve_doc.get("items", []),
+                    "batch_mode": not used_individual,
+                }
+
     summary = {"stage": "5", "profile": policy.get("profile", args.profile), "scanned": len(files)}
 
     # после цикла по файлам (evidences собраны)
@@ -2269,6 +2425,12 @@ def main(argv: list[str] | None = None) -> int:
         evidences=evidences, merge_msis=getattr(args, "msi_merge", False),
         merge_top=getattr(args, "msi_merge_top", 12), compact=getattr(args, "compact", False),
     )
+
+    # Default human report path from env when --human-out not passed (CLI has priority)
+    if getattr(args, "human_out", None) is None:
+        args.human_out = os.getenv("BIN_GATE_HUMAN_OUT_DEFAULT")
+        if args.human_out:
+            _cli_dbg(f"Using default human report path from env: {args.human_out}")
 
     if args.human_out:
         try:

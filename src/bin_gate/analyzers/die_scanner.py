@@ -61,49 +61,66 @@ def _die_executable_for_image(image: str) -> str:
     return DIE_EXECUTABLE
 
 
+def _extract_one_balanced_block(text: str, start: int) -> Optional[str]:
+    """Extract a single {...} block with balanced braces from text starting at start (skip braces in strings)."""
+    n = len(text)
+    if start < 0 or start >= n or text[start] != "{":
+        return None
+    depth = 0
+    j = start
+    while j < n:
+        ch = text[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : j + 1]
+        elif ch == '"' and j > 0 and text[j - 1] != "\\":
+            k = j + 1
+            while k < n:
+                if text[k] == "\\":
+                    k += 2
+                    continue
+                if text[k] == '"':
+                    j = k
+                    break
+                k += 1
+        j += 1
+    return None
+
+
 def _extract_json_blocks(text: str) -> List[str]:
     """
     Extract one or more JSON object blocks from diec stdout.
-    diec may prefix JSON with a filename line (e.g. '/target/file:\\n' or 'path:\\n').
-    Returns list of JSON substrings (each starts with { and has balanced braces).
+    Uses re.findall(r'(\\{.*?\\})', stdout, re.DOTALL) so path prefixes
+    (e.g. /usr/bin/diec:, /target/file:) are ignored and only JSON objects
+    are parsed. For nested JSON (failed json.loads) falls back to
+    balanced-brace extraction.
     """
     if not text or not text.strip():
         return []
+    # Ignore prefixes like /usr/bin/diec: — extract only {...} blocks
+    candidates = re.findall(r"(\{.*?\})", text, re.DOTALL)
     blocks: List[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        # Find next '{'
-        start = text.find("{", i)
-        if start == -1:
-            break
-        depth = 0
-        j = start
-        while j < n:
-            ch = text[j]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    blocks.append(text[start : j + 1])
-                    i = j + 1
-                    break
-            elif ch == '"' and j > 0 and text[j - 1] != "\\":
-                # Skip string content so we don't count braces inside strings
-                k = j + 1
-                while k < n:
-                    if text[k] == "\\":
-                        k += 2
-                        continue
-                    if text[k] == '"':
-                        j = k
-                        break
-                    k += 1
-            j += 1
-        else:
-            # Unbalanced, skip this { and continue
-            i = start + 1
+    pos = 0
+    for c in candidates:
+        try:
+            json.loads(c)
+            blocks.append(c)
+            pos = text.find(c, pos) + len(c)
+        except json.JSONDecodeError:
+            # Nested JSON: regex stopped at first '}'; extract full balanced block
+            idx = text.find(c, pos)
+            if idx >= 0:
+                one = _extract_one_balanced_block(text, idx)
+                if one:
+                    blocks.append(one)
+                    pos = idx + len(one)
+                    continue
+            pos = text.find(c, pos)
+            if pos >= 0:
+                pos += len(c)
     return blocks
 
 
@@ -469,15 +486,23 @@ class DieScanner:
             "raw_die": die_out,
         }
 
-        # DIE output can be array or object
-        detects_list = []
+        # DIE output: detects can be list of {type, name} or list of {filetype, values: [{type, name}]} (horsicq diec)
+        detects_list: List[Dict[str, Any]] = []
         if isinstance(die_out, list):
             detects_list = die_out
         elif isinstance(die_out, dict):
-            detects_list = die_out.get("detects") or die_out.get("records") or []
-            # Some DIE versions have different structure
-            if not detects_list and "values" in die_out:
-                detects_list = die_out.get("values", [])
+            raw_detects = die_out.get("detects") or die_out.get("records") or []
+            if not raw_detects and "values" in die_out:
+                raw_detects = die_out.get("values", [])
+            for item in raw_detects or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") or item.get("name") or item.get("sName"):
+                    detects_list.append(item)
+                else:
+                    for v in item.get("values") or []:
+                        if isinstance(v, dict) and (v.get("type") or v.get("name") or v.get("sName")):
+                            detects_list.append(v)
 
         packer_families: Set[str] = set()
 
@@ -1144,17 +1169,27 @@ class DieBatchMap:
             "batch_mode": True,
         }
         
-        # Извлекаем detects
-        detects_list = item.get("detects") or item.get("records") or []
-        if isinstance(item.get("values"), list):
-            detects_list = item.get("values", [])
-            
+        # Извлекаем detects; horsicq diec: detects = [{filetype, values: [{type, name}]}]
+        raw_detects = item.get("detects") or item.get("records") or []
+        if not raw_detects and isinstance(item.get("values"), list):
+            raw_detects = item.get("values", [])
+        detects_list: List[Dict[str, Any]] = []
+        for det in raw_detects:
+            if not isinstance(det, dict):
+                continue
+            if det.get("type") or det.get("name") or det.get("sName"):
+                detects_list.append(det)
+            else:
+                for v in det.get("values") or []:
+                    if isinstance(v, dict) and (v.get("type") or v.get("name") or v.get("sName")):
+                        detects_list.append(v)
+
         packer_families: Set[str] = set()
-        
+
         for det in detects_list:
             if not isinstance(det, dict):
                 continue
-                
+
             detect_type = (det.get("type") or det.get("sType") or "").lower()
             name = det.get("name") or det.get("sName") or det.get("string") or ""
             version = det.get("version") or det.get("sVersion") or ""

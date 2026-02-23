@@ -10,15 +10,39 @@ Flow:
 Docker is MANDATORY. Uses volume caching for Grype DB and Syft cache.
 """
 from __future__ import annotations
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 from pathlib import Path
 from dataclasses import dataclass, field
 import subprocess
 import shutil
 import json
 import os
+import re
 import tempfile
 import time
+
+# DLL name regex for emulation-based extraction (same logic as orchestrate, no circular import)
+_DLL_NAME_PATTERN = re.compile(r"\b[\w\-. ]+\.[Dd][Ll][Ll]\b")
+
+
+def _extract_dll_names_from_emulation(emu: Dict[str, Any]) -> List[str]:
+    """Collect unique DLL names from emulation.api_summary keys and emulation.decoded_strings."""
+    if not emu or not isinstance(emu, dict):
+        return []
+    results: Set[str] = set()
+    strings_to_scan: List[str] = []
+    api_summary = emu.get("api_summary") or {}
+    if isinstance(api_summary, dict):
+        strings_to_scan.extend(api_summary.keys())
+    for s in emu.get("decoded_strings") or []:
+        if isinstance(s, str):
+            strings_to_scan.append(s)
+    for text in strings_to_scan:
+        for m in _DLL_NAME_PATTERN.finditer(text):
+            name = m.group(0).strip()
+            if len(name) <= 256:
+                results.add(name)
+    return list(results)
 
 from ..docker_utils import (
     check_docker_available, image_exists, pull_image,
@@ -449,10 +473,11 @@ class ContainerVulnerabilityScanner:
             return False, err
         return True, ""
 
-    def _run_syft(self, target_path: Path) -> Tuple[Optional[dict], str]:
+    def _run_syft(self, target_path: Path, force_pe_cataloger: bool = False) -> Tuple[Optional[dict], str]:
         """
         Run Syft to generate SBOM.
         Returns (sbom_dict, error_message).
+        force_pe_cataloger: when True (e.g. memory dump masked as .exe), force PE binary package cataloger.
         """
         ok, err = self._ensure_image(self.config.syft_image)
         if not ok:
@@ -482,6 +507,13 @@ class ContainerVulnerabilityScanner:
             "/target",
             "-o", "cyclonedx-json",
         ]
+        # Memory dump (.dmp / masked .exe): deep binary cataloging — PE imports + classifier (zlib, openssl, etc. in binary body)
+        if force_pe_cataloger or target_path.suffix.lower() == ".dmp":
+            cmd.extend(["--select-catalogers", "+pe-binary-package-cataloger"])
+            cmd.extend(["--select-catalogers", "+binary-classifier-cataloger"])
+            cmd.extend(["--exclude-binary-packages-with-file-ownership-overlap", "false"])
+        if target_path.suffix.lower() == ".dmp":
+            cmd.extend(["--scope", "all-layers"])
         # Remove empty strings from cmd
         cmd = [c for c in cmd if c]
 
@@ -542,15 +574,22 @@ class ContainerVulnerabilityScanner:
                     drive = sbom_tmp_path[0].lower()
                     sbom_path_docker = f"/{drive}{sbom_tmp_path[2:].replace(os.sep, '/')}"
 
+            # Offline по умолчанию: контейнер без сети, без проверки версии/БД (иначе toolbox-data.anchore.io)
+            grype_offline = os.getenv("BIN_GATE_GRYPE_OFFLINE", "1").strip().lower() in ("1", "true", "yes")
+            grype_args = ["--offline", "sbom:/sbom.json", "-o", "json"] if grype_offline else ["sbom:/sbom.json", "-o", "json"]
+            use_network_none = self.config.grype_network_none or grype_offline
+            grype_db_mount = get_grype_volume_mount()
             cmd = [
                 "docker", "run",
                 "--rm" if self.config.cleanup_containers else "",
-                "--network", "none" if self.config.grype_network_none else "bridge",
+                "--network", "none" if use_network_none else "bridge",
+                "-e", "GRYPE_CHECK_FOR_APP_UPDATE=false",
+                "-e", "GRYPE_DB_AUTO_UPDATE=false",
+                "-e", "GRYPE_DB_VALIDATE_AGE=false",
+                "-v", grype_db_mount,
                 "-v", f"{sbom_path_docker}:/sbom.json:ro",
                 self.config.grype_image,
-                "sbom:/sbom.json",
-                "-o", "json",
-            ]
+            ] + grype_args
             cmd = [c for c in cmd if c]
 
             result = subprocess.run(
@@ -676,7 +715,7 @@ class ContainerVulnerabilityScanner:
         }
         return type_map.get(pkg_type.lower(), pkg_type or "unknown")
 
-    def scan(self, target_path: Path) -> Dict[str, Any]:
+    def scan(self, target_path: Path, force_pe_cataloger: bool = False, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Main scan method. Returns Evidence.cve compatible dict:
         {
@@ -685,6 +724,8 @@ class ContainerVulnerabilityScanner:
             "notes": [...],
             "sbom_components": int  # number of components in SBOM
         }
+        force_pe_cataloger: when True, pass --select-catalogers +pe-binary-package-cataloger to Syft (e.g. for dumps masked as .exe).
+        evidence: optional; if Syft returns 0 components, dynamic_lib from supply_chain.dependencies are injected as library components (version 1.0.0) and passed to Grype.
         """
         result: Dict[str, Any] = {
             "summary": _sev_buckets(),
@@ -700,7 +741,7 @@ class ContainerVulnerabilityScanner:
             return result
 
         # Step 1: Generate SBOM with Syft
-        sbom, err = self._run_syft(target_path)
+        sbom, err = self._run_syft(target_path, force_pe_cataloger=force_pe_cataloger)
         if err:
             result["notes"].append(f"cve_syft:{err}")
             return result
@@ -708,9 +749,67 @@ class ContainerVulnerabilityScanner:
             result["notes"].append("cve_syft:empty_sbom")
             return result
 
-        # Count SBOM components
-        components = sbom.get("components") or []
+        # Count SBOM components and keep list for logging (e.g. emulation dump)
+        components = list(sbom.get("components") or [])
+        if evidence is not None:
+            _cve_log(f"DEBUG: current supply_chain deps count: {len(evidence.get('supply_chain', {}).get('dependencies', []))}")
+        # Dump fix: if Syft returns 0 components, always take evidence["supply_chain"]["dependencies"] and feed to Grype with version 1.0.0
+        deps_current = ((evidence or {}).get("supply_chain") or {}).get("dependencies") or []
+        has_dynamic_lib = any(
+            isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value")
+            for d in deps_current
+        )
+        if evidence and has_dynamic_lib:
+            deps = deps_current
+            dynamic_libs = [
+                (d.get("value") or "").strip() for d in deps
+                if isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value")
+            ]
+            dynamic_libs = [n for n in dynamic_libs if n and len(n) <= 500]
+            if dynamic_libs:
+                injected = []
+                seen_names: set = set()
+                dump_ver = "1.0.0"
+                for name in dynamic_libs:
+                    safe_name = name[:200].replace("\\", "_").replace("/", "_")
+                    if not safe_name:
+                        continue
+                    bom_ref = f"pkg:generic/{safe_name}@{dump_ver}"
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        injected.append({"bom-ref": bom_ref, "type": "library", "name": name, "version": dump_ver})
+                    if name.lower().endswith(".dll"):
+                        stem = name[:-4].strip()
+                        if stem and stem not in seen_names and len(stem) <= 200:
+                            seen_names.add(stem)
+                            safe_stem = stem.replace("\\", "_").replace("/", "_")
+                            bom_ref_stem = f"pkg:generic/{safe_stem}@{dump_ver}"
+                            injected.append({"bom-ref": bom_ref_stem, "type": "library", "name": stem, "version": dump_ver})
+                if not components:
+                    sbom = {
+                        "bomFormat": "CycloneDX",
+                        "specVersion": "1.4",
+                        "version": 1,
+                        "components": injected,
+                    }
+                    components = injected
+                    result["notes"].append("cve_sbom:injected_dynamic_lib_from_supply_chain")
+                    _cve_log(f"Syft failed on dump, injecting {len(injected)} libraries from emulation directly to Grype.")
+                else:
+                    # Supplement: add injected libs so Grype guaranteed gets them
+                    existing_names = {c.get("name") for c in components if c.get("name")}
+                    added = [c for c in injected if c.get("name") not in existing_names]
+                    if added:
+                        components = components + added
+                        sbom["components"] = components
+                        result["notes"].append("cve_sbom:supplemented_with_supply_chain_deps")
+                        _cve_log(f"Supplemented SBOM with {len(added)} libraries from supply_chain.")
+
         result["sbom_components"] = len(components)
+        result["sbom_component_list"] = [
+            f"{c.get('name', '')}@{c.get('version', '')}".strip("@") or c.get("bom-ref", "")
+            for c in components
+        ]
 
         if not components:
             # No components found, nothing to scan
@@ -729,6 +828,21 @@ class ContainerVulnerabilityScanner:
         # Step 3: Parse results
         try:
             summary, items = self._parse_grype_results(grype_out)
+            # Fix report map: ensure every component we sent to Grype appears in items (incl. forced/injected libs)
+            seen_pkg = {it.get("package") for it in items if it.get("package")}
+            for c in components:
+                name = c.get("name") or ""
+                if not name or name in seen_pkg:
+                    continue
+                seen_pkg.add(name)
+                items.append({
+                    "package": name,
+                    "ecosystem": "Binary",
+                    "version": c.get("version") or "",
+                    "arch": "",
+                    "lib": [],
+                    "vulns": [],
+                })
             result["summary"] = summary
             result["items"] = items
         except Exception as e:
@@ -1238,21 +1352,27 @@ def pre_scan_vulnerabilities(
 def get_batch_results_for_file(file_path: Path) -> Dict[str, Any]:
     """
     Получает CVE результаты для файла из глобального batch-скана.
-    
+
     Используется в цикле анализа вместо индивидуальных вызовов collect_cve_for_file.
-    
+    .dmp файлы никогда не берутся из batch — только индивидуальный collect_cve_for_file.
+
     Returns:
         Словарь в формате Evidence.cve
     """
     global _batch_map
-    
+
     if _batch_map is None:
         return {
             "summary": _sev_buckets(),
             "items": [],
             "notes": ["cve_batch_not_initialized"],
         }
-        
+    # Dumps must never use batch; they go through individual collect_cve_for_file only
+    if isinstance(file_path, Path) and file_path.suffix.lower() == ".dmp":
+        return {"summary": _sev_buckets(), "items": [], "notes": ["cve_batch_skipped_dump"]}
+    if isinstance(file_path, str) and file_path.lower().endswith(".dmp"):
+        return {"summary": _sev_buckets(), "items": [], "notes": ["cve_batch_skipped_dump"]}
+
     return _batch_map.get_results_for_file(file_path)
 
 
@@ -1260,6 +1380,12 @@ def is_batch_scan_ready() -> bool:
     """Проверяет, был ли выполнен batch CVE-скан."""
     global _batch_map
     return _batch_map is not None and _batch_map.is_ready
+
+
+def get_batch_vulnerability_map() -> Optional[BatchVulnerabilityMap]:
+    """Возвращает текущий batch map (после pre_scan_vulnerabilities)."""
+    global _batch_map
+    return _batch_map
 
 
 # ---------------------------------------------------------------------------
@@ -1291,16 +1417,128 @@ def collect_cve_for_file(
     Note: ecosystem, inventory_path, libmap_path, osv_timeout_sec are kept
     for backward compatibility but are not used (Syft/Grype handle detection).
     """
-    # Normalize path
-    if isinstance(file_path, str):
-        file_path = Path(file_path)
+    # Syft on dump returns 0 libs: use LOADED_MODULE / ev["emulation"]["modules"] and force into supply_chain
+    if ev and (".dmp" in str(file_path) or "VMProtect" in str(ev)):
+        real_libs = [
+            d["value"] for d in ev.get("supply_chain", {}).get("dependencies", [])
+            if d.get("type") == "dynamic_lib" and d.get("value")
+        ]
+        emu = ev.get("emulation") or {}
+        if emu.get("modules"):
+            existing_values = {d.get("value") for d in ev.get("supply_chain", {}).get("dependencies", []) if isinstance(d, dict)}
+            deps = ev.setdefault("supply_chain", {}).get("dependencies", []) or []
+            for name in emu["modules"]:
+                if isinstance(name, str) and name.strip() and name.strip() not in existing_values:
+                    deps.append({"type": "dynamic_lib", "value": name.strip(), "source": "emulation_modules"})
+                    existing_values.add(name.strip())
+            ev["supply_chain"]["dependencies"] = deps
+            real_libs = [d["value"] for d in ev["supply_chain"]["dependencies"] if d.get("type") == "dynamic_lib" and d.get("value")]
+        if not real_libs and ev.get("emulation"):
+            extracted = _extract_dll_names_from_emulation(ev.get("emulation") or {})
+            if extracted:
+                existing_deps = ev.setdefault("supply_chain", {}).get("dependencies", []) or []
+                for lib in extracted:
+                    if lib not in [d.get("value") for d in existing_deps if isinstance(d, dict)]:
+                        existing_deps.append({"type": "dynamic_lib", "value": lib, "source": "forced_fix_v0.0.8"})
+                ev["supply_chain"]["dependencies"] = existing_deps
+                real_libs = extracted
+        if real_libs:
+            n = len(real_libs)
+            _cve_log(f"Injecting {n} real libraries from emulation into Grype.")
+            print(f"[cve_collector] Injecting {n} real libraries from emulation into Grype.")
 
-    # Initialize result
+    # Initialize result early so manual Grype path can return it
     result: Dict[str, Any] = {
         "summary": _sev_buckets(),
         "items": [],
         "notes": [],
     }
+
+    # Force CVE scan: if we have at least one DLL, force generate SBOM and run Grype; use real version from module_details when available.
+    deps = ((ev or {}).get("supply_chain") or {}).get("dependencies") or []
+    has_dynamic_lib = any(isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value") for d in deps)
+    emu = (ev or {}).get("emulation") or {}
+    module_details = emu.get("module_details") or emu.get("detailed_modules") or []
+    version_by_name: Dict[str, str] = {}
+    for md in module_details:
+        if isinstance(md, dict) and md.get("name"):
+            n = (md.get("name") or "").strip().lower()
+            v = (md.get("version") or "").strip()
+            if n and v and v != "—":
+                version_by_name[n] = v
+    if ev and has_dynamic_lib:
+        forced_names = [
+            (d.get("value") or "").strip() for d in deps
+            if isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value")
+        ]
+        forced_names = [n for n in forced_names if n and len(n) <= 500]
+        if forced_names:
+            try:
+                scanner = _get_scanner(docker_config)
+            except Exception:
+                scanner = None
+            if scanner:
+                injected: List[Dict[str, Any]] = []
+                seen_names: set = set()
+                for name in forced_names:
+                    safe_name = name[:200].replace("\\", "_").replace("/", "_")
+                    if not safe_name:
+                        continue
+                    emu_ver = version_by_name.get(name.lower()) or version_by_name.get(name[:-4].lower() if name.lower().endswith(".dll") else "") or "1.0.0"
+                    bom_ref = f"pkg:generic/{safe_name}@{emu_ver}"
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        injected.append({"bom-ref": bom_ref, "type": "library", "name": name, "version": emu_ver})
+                    if name.lower().endswith(".dll"):
+                        stem = name[:-4].strip()
+                        if stem and stem not in seen_names and len(stem) <= 200:
+                            seen_names.add(stem)
+                            stem_ver = version_by_name.get(stem.lower()) or version_by_name.get(name.lower()) or "1.0.0"
+                            safe_stem = stem.replace("\\", "_").replace("/", "_")
+                            bom_ref_stem = f"pkg:generic/{safe_stem}@{stem_ver}"
+                            injected.append({"bom-ref": bom_ref_stem, "type": "library", "name": stem, "version": stem_ver})
+                sbom = {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.4",
+                    "version": 1,
+                    "components": injected,
+                }
+                grype_out, err = scanner._run_grype(sbom)
+                if not err and grype_out:
+                    summary, items = scanner._parse_grype_results(grype_out)
+                    seen_pkg = {it.get("package") for it in items if it.get("package")}
+                    for c in injected:
+                        n = c.get("name") or ""
+                        if n and n not in seen_pkg:
+                            seen_pkg.add(n)
+                            items.append({
+                                "package": n,
+                                "ecosystem": "Binary",
+                                "version": c.get("version") or "",
+                                "arch": "",
+                                "lib": [],
+                                "vulns": [],
+                            })
+                    result["summary"] = summary
+                    result["items"] = items
+                    result["notes"].append("cve_individual_forced_grype")
+                    result["sbom_components"] = len(injected)
+                    result["sbom_component_list"] = [
+                        f"{c.get('name', '')}@{c.get('version', '')}".strip("@") or c.get("bom-ref", "")
+                        for c in injected
+                    ]
+                    return result
+                if err:
+                    result["notes"].append(f"cve_forced_grype:{err}")
+                else:
+                    result["notes"].append("cve_forced_grype:empty_result")
+
+    # Nuclear debug: show full supply_chain and ev identity (compare id with orchestrate FORCE INJECTION)
+    print(f"DEBUG_CVE_FLOW: File={file_path} | ev id={id(ev) if ev else 'no ev'} | Full Supply Chain={ev.get('supply_chain') if ev else 'no ev'}")
+
+    # Normalize path
+    if isinstance(file_path, str):
+        file_path = Path(file_path)
 
     # Validate path
     if not file_path.exists():
@@ -1314,16 +1552,101 @@ def collect_cve_for_file(
         result["notes"].append(f"cve_scanner_init_error:{e}")
         return result
 
-    # Scan
+    # Mask .dmp as .exe for Syft: create temp copy with .exe so Syft treats it as PE and we can force PE cataloger
+    path_for_scan = file_path
+    temp_exe_path: Optional[Path] = None
+    if file_path.suffix.lower() == ".dmp":
+        try:
+            fd, temp_exe_path_str = tempfile.mkstemp(suffix=".exe", prefix="temp_dump_for_syft_")
+            os.close(fd)
+            temp_exe_path = Path(temp_exe_path_str)
+            shutil.copy2(file_path, temp_exe_path)
+            path_for_scan = temp_exe_path
+        except Exception as e:
+            result["notes"].append(f"cve_dump_copy_error:{e}")
+            return result
+
     try:
-        scan_result = scanner.scan(file_path)
+        # Scan (force_pe_cataloger when we masked a dump as .exe; evidence for dynamic_lib → SBOM fallback).
+        # Synthetic SBOM: if Syft returns 0 components but ev["supply_chain"]["dependencies"] has data,
+        # the scanner builds a synthetic CycloneDX SBOM from those deps and runs Grype on it.
+        scan_result = scanner.scan(
+            path_for_scan,
+            force_pe_cataloger=(temp_exe_path is not None),
+            evidence=ev,
+        )
         result["summary"] = scan_result.get("summary", result["summary"])
         result["items"] = scan_result.get("items", [])
         result["notes"] = scan_result.get("notes", [])
         if "sbom_components" in scan_result:
             result["sbom_components"] = scan_result["sbom_components"]
+        if "sbom_component_list" in scan_result:
+            result["sbom_component_list"] = scan_result["sbom_component_list"]
+        # If Syft on dump found nothing, force use extracted DLLs for SBOM with version 1.0.0
+        if result.get("sbom_components") == 0 and ev and (ev.get("supply_chain") or {}).get("dependencies"):
+            deps = ev["supply_chain"]["dependencies"]
+            forced_names = [
+                (d.get("value") or "").strip() for d in deps
+                if isinstance(d, dict) and d.get("type") == "dynamic_lib" and d.get("value")
+            ]
+            forced_names = [n for n in forced_names if n and len(n) <= 500]
+            if forced_names:
+                try:
+                    emu_ver = "1.0.0"
+                    injected: List[Dict[str, Any]] = []
+                    seen_names: set = set()
+                    for name in forced_names:
+                        safe_name = name[:200].replace("\\", "_").replace("/", "_")
+                        if not safe_name:
+                            continue
+                        bom_ref = f"pkg:generic/{safe_name}@{emu_ver}"
+                        if name not in seen_names:
+                            seen_names.add(name)
+                            injected.append({"bom-ref": bom_ref, "type": "library", "name": name, "version": emu_ver})
+                        if name.lower().endswith(".dll"):
+                            stem = name[:-4].strip()
+                            if stem and stem not in seen_names and len(stem) <= 200:
+                                seen_names.add(stem)
+                                safe_stem = stem.replace("\\", "_").replace("/", "_")
+                                injected.append({"bom-ref": f"pkg:generic/{safe_stem}@{emu_ver}", "type": "library", "name": stem, "version": emu_ver})
+                    sbom = {"bomFormat": "CycloneDX", "specVersion": "1.4", "version": 1, "components": injected}
+                    grype_out, err = scanner._run_grype(sbom)
+                    if not err and grype_out:
+                        summary, items = scanner._parse_grype_results(grype_out)
+                        seen_pkg = {it.get("package") for it in items if it.get("package")}
+                        for c in injected:
+                            n = c.get("name") or ""
+                            if n and n not in seen_pkg:
+                                seen_pkg.add(n)
+                                items.append({"package": n, "ecosystem": "Binary", "version": c.get("version") or "", "arch": "", "lib": [], "vulns": []})
+                        result["summary"] = summary
+                        result["items"] = items
+                        result["notes"].append("cve_sbom_fallback_dynamic_lib_1.0.0")
+                        result["sbom_components"] = len(injected)
+                        result["sbom_component_list"] = [f"{c.get('name', '')}@{c.get('version', '')}".strip("@") or c.get("bom-ref", "") for c in injected]
+                except Exception as e:
+                    result["notes"].append(f"cve_sbom_fallback_error:{e}")
+        # Log libraries extracted from emulation dump to cli_debug.log: [cve_collector] emulation dump: libraries extracted (N): {list}
+        is_dump = file_path.suffix.lower() == ".dmp" or (
+            ev and (ev.get("emulation") or {}).get("memory_dump_path")
+            and str(Path((ev.get("emulation") or {}).get("memory_dump_path", "")).resolve()) == str(file_path.resolve())
+        )
+        if is_dump:
+            libs = result.get("sbom_component_list") or []
+            if libs:
+                libs_list = ", ".join(libs[:50]) + (f" ... +{len(libs) - 50} more" if len(libs) > 50 else "")
+                _cve_log(f"emulation dump: libraries extracted ({len(libs)}): {libs_list}")
+            else:
+                _cve_log("emulation dump: no libraries extracted (Syft ran on dump)")
     except Exception as e:
         result["notes"].append(f"cve_scan_error:{e}")
+    finally:
+        # Cleanup: remove temporary .exe copy of the dump
+        if temp_exe_path is not None and temp_exe_path.exists():
+            try:
+                temp_exe_path.unlink()
+            except Exception:
+                pass
 
     return result
 
@@ -1379,19 +1702,26 @@ def update_grype_db(timeout_sec: int = 600) -> Tuple[bool, str]:
         return False, f"grype_pull_failed:{err}"
 
     try:
-        # Run grype db update
+        grype_db_mount = get_grype_volume_mount()
         result = subprocess.run(
-            ["docker", "run", "--rm", GRYPE_IMAGE, "db", "update"],
+            ["docker", "run", "--rm", "-v", grype_db_mount, GRYPE_IMAGE, "db", "update"],
             capture_output=True,
             text=True,
             timeout=timeout_sec,
         )
         if result.returncode == 0:
             return True, "grype_db_updated"
-        return False, f"grype_db_update_failed:{result.stderr[:200]}"
+        stderr_snip = (result.stderr or "")[:200]
+        # When update fails (e.g. network unreachable), force offline for subsequent Grype scan
+        os.environ["BIN_GATE_GRYPE_OFFLINE"] = "1"
+        return False, f"grype_db_update_failed:{stderr_snip}"
     except subprocess.TimeoutExpired:
+        os.environ["BIN_GATE_GRYPE_OFFLINE"] = "1"
         return False, f"grype_db_update_timeout:{timeout_sec}s"
     except Exception as e:
+        err_str = str(e).lower()
+        if "network" in err_str or "unreachable" in err_str or "connection" in err_str:
+            os.environ["BIN_GATE_GRYPE_OFFLINE"] = "1"
         return False, f"grype_db_update_error:{e}"
 
 

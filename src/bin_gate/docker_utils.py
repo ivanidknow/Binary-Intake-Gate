@@ -8,7 +8,7 @@ Provides volume caching for Grype DB and DIE signatures to avoid update checks.
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import subprocess
 import os
 import sys
@@ -22,6 +22,8 @@ DIE_CACHE_VOLUME = "bin-gate-die-cache"
 SYFT_IMAGE = "anchore/syft:latest"
 GRYPE_IMAGE = "anchore/grype:latest"
 DIE_IMAGE = "horsicq:diec"  # Custom local DIE image
+EMULATION_IMAGE = "bin-gate-emulation:latest"  # Local build from docker/emulation/
+CWE_CHECKER_IMAGE = "fkiecad/cwe_checker:latest"
 
 
 class DockerNotAvailableError(Exception):
@@ -222,9 +224,9 @@ def ensure_images(images: Optional[List[str]] = None) -> dict[str, bool]:
 
 
 def get_grype_volume_mount() -> str:
-    """Get volume mount string for Grype DB caching."""
+    """Get volume mount string for Grype DB (path must match grype db status: /.cache/grype/db)."""
     create_volume_if_not_exists(GRYPE_DB_VOLUME)
-    return f"{GRYPE_DB_VOLUME}:/root/.cache/grype"
+    return f"{GRYPE_DB_VOLUME}:/.cache/grype/db"
 
 
 def get_syft_volume_mount() -> str:
@@ -302,7 +304,7 @@ def run_docker_container(
 ) -> Tuple[int, str, str]:
     """
     Run Docker container with standard options.
-    
+
     Returns:
         (return_code, stdout, stderr)
     """
@@ -312,7 +314,7 @@ def run_docker_container(
         volumes=volumes,
         network=network,
     )
-    
+
     try:
         result = subprocess.run(
             cmd,
@@ -329,6 +331,247 @@ def run_docker_container(
         return -1, "", f"container timeout ({timeout}s)"
     except Exception as e:
         return -1, "", str(e)
+
+
+def _emulation_docker_context() -> Path:
+    """Path to docker/emulation (project root = parent of src)."""
+    # docker_utils is in src/bin_gate/
+    project_root = Path(__file__).resolve().parents[2]
+    return project_root / "docker" / "emulation"
+
+
+def build_emulation_image() -> Tuple[bool, str]:
+    """
+    Build bin-gate-emulation Docker image from docker/emulation/Dockerfile.
+    Returns (success, error_message).
+    """
+    ctx = _emulation_docker_context()
+    dockerfile = ctx / "Dockerfile"
+    if not dockerfile.exists():
+        return False, f"Dockerfile not found: {dockerfile}"
+    try:
+        result = subprocess.run(
+            ["docker", "build", "-t", EMULATION_IMAGE, "."],
+            cwd=ctx,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or result.stdout.strip() or "docker build failed"
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "docker build timeout (600s)"
+    except Exception as e:
+        return False, str(e)
+
+
+def _host_path_for_docker_mount(path: Path) -> str:
+    """Convert host path to form Docker accepts (Windows: /c/Users/...)."""
+    s = str(path.resolve())
+    if len(s) >= 2 and s[1] == ":":
+        drive = s[0].lower()
+        return f"/{drive}{s[2:].replace(os.sep, '/')}"
+    return s.replace(os.sep, "/")
+
+
+def run_emulation_container(
+    host_file_path: Path,
+    timeout: int = 60,
+) -> Tuple[int, str, str, Optional[Dict[str, Any]]]:
+    """
+    Run Speakeasy emulation in Docker. Mounts host_file_path parent as /input and a temp dir as /output.
+    Container outputs structured JSON between !!!JSON_REPORT_START!!! and !!!JSON_REPORT_END!!! (no Base64).
+    !!!MODULE_LOADED:<name> lines are parsed into report_dict["modules"]. Returns (return_code, stdout, stderr, report_dict).
+    """
+    import tempfile
+    import json as _json
+    host_file_path = Path(host_file_path)
+    if not host_file_path.exists():
+        return -1, "", f"file not found: {host_file_path}", None
+
+    input_mount = f"{_host_path_for_docker_mount(host_file_path.parent)}:/input:ro"
+    container_input_file = f"/input/{host_file_path.name}"
+
+    report_dict: Optional[Dict[str, Any]] = None
+    with tempfile.TemporaryDirectory(prefix="bin_gate_emu_out_") as out_dir:
+        out_path = Path(out_dir)
+        report_file_host = out_path / "emu_report.json"
+        output_mount = f"{_host_path_for_docker_mount(out_path)}:/output"
+        report_path_container = "/output/emu_report.json"
+
+        cmd = [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", input_mount,
+            "-v", output_mount,
+            "-e", f"INPUT_FILE={container_input_file}",
+            "-e", f"TIMEOUT={timeout}",
+            "-e", f"WRITE_REPORT={report_path_container}",
+            EMULATION_IMAGE,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout + 30,
+            )
+        except subprocess.TimeoutExpired:
+            return -1, "", f"container timeout ({timeout + 30}s)", None
+        except Exception as e:
+            return -1, "", str(e), None
+
+        import re as _re
+        stdout_str = result.stdout or ""
+        if report_file_host.exists():
+            try:
+                with open(report_file_host, "r", encoding="utf-8") as f:
+                    report_dict = _json.load(f)
+            except Exception:
+                report_dict = None
+        # Prefer new markers, then legacy
+        if report_dict is None and "!!!JSON_REPORT_START!!!" in stdout_str and "!!!JSON_REPORT_END!!!" in stdout_str:
+            try:
+                i = stdout_str.index("!!!JSON_REPORT_START!!!") + len("!!!JSON_REPORT_START!!!")
+                j = stdout_str.index("!!!JSON_REPORT_END!!!")
+                json_str = stdout_str[i:j].strip()
+                if json_str:
+                    report_dict = _json.loads(json_str)
+            except Exception:
+                report_dict = None
+        if report_dict is None and "EMU_JSON_START" in stdout_str and "EMU_JSON_END" in stdout_str:
+            try:
+                i = stdout_str.index("EMU_JSON_START") + len("EMU_JSON_START")
+                j = stdout_str.index("EMU_JSON_END")
+                json_str = stdout_str[i:j].strip()
+                if json_str:
+                    report_dict = _json.loads(json_str)
+            except Exception:
+                report_dict = None
+        if report_dict is None and "{" in stdout_str and "}" in stdout_str:
+            try:
+                start = stdout_str.rfind("{")
+                end = stdout_str.rfind("}") + 1
+                if start >= 0 and end > start:
+                    report_dict = _json.loads(stdout_str[start:end])
+            except Exception:
+                pass
+        if report_dict is None and "{" in stdout_str:
+            try:
+                match = _re.search(r"\{.*\}", stdout_str, _re.DOTALL)
+                if match:
+                    report_dict = _json.loads(match.group(0))
+            except Exception:
+                pass
+        # Collect DLL names from !!!MODULE_LOADED!!!: / !!!MODULE_LOADED: (grab DLL even if separated by weird chars)
+        loaded_from_stdout = []
+        for m in _re.finditer(r"!!!MODULE_LOADED!!!:.*?([\w\-. ]+\.dll)", stdout_str, _re.IGNORECASE):
+            name = m.group(1).strip()
+            if name and name not in loaded_from_stdout and len(name) <= 256:
+                loaded_from_stdout.append(name)
+        for m in _re.finditer(r"!!!MODULE_LOADED:\s*(.+?)(?:\r?\n|$)", stdout_str):
+            name = m.group(1).strip()
+            if name and name not in loaded_from_stdout and len(name) <= 256:
+                loaded_from_stdout.append(name)
+        for m in _re.finditer(r"!!!DLL_LOADED:\s*(.+?)(?:\r?\n|$)", stdout_str):
+            name = m.group(1).strip()
+            if name and name not in loaded_from_stdout and len(name) <= 256:
+                loaded_from_stdout.append(name)
+        for m in _re.finditer(r"LOADED_MODULE:\s*(.+?\.dll)", stdout_str, _re.IGNORECASE):
+            name = m.group(1).strip()
+            if name and name not in loaded_from_stdout and len(name) <= 256:
+                loaded_from_stdout.append(name)
+        # Parse !!!MODULE_INFO!!!: new format name=...|ver=...|hash=... then fallback to old name|version|hash
+        module_details: list = []
+        for m in _re.finditer(r"!!!MODULE_INFO!!!:name=([^|]+)\|ver=([^|]*)\|hash=(.+?)(?:\r?\n|$)", stdout_str):
+            name = (m.group(1) or "").strip()
+            version = (m.group(2) or "").strip()
+            hash_part = (m.group(3) or "").strip()
+            if name and len(name) <= 256:
+                module_details.append({"name": name, "version": version or "", "hash": hash_part or ""})
+        if not module_details:
+            for m in _re.finditer(r"!!!MODULE_INFO!!!:([^|]+)\|([^|]*)\|(.+?)(?:\r?\n|$)", stdout_str):
+                name = (m.group(1) or "").strip()
+                version = (m.group(2) or "").strip()
+                hash_part = (m.group(3) or "").strip()
+                if name and len(name) <= 256:
+                    module_details.append({"name": name, "version": version or "", "hash": hash_part or ""})
+        if module_details:
+            if report_dict is None:
+                report_dict = {"modules": [], "api_summary": {}, "decoded_strings": [], "module_details": [], "detailed_modules": []}
+            report_dict["module_details"] = module_details
+            report_dict["detailed_modules"] = list(module_details)
+        elif report_dict is not None:
+            report_dict.setdefault("module_details", [])
+            report_dict.setdefault("detailed_modules", [])
+        if loaded_from_stdout:
+            if report_dict is None:
+                report_dict = {"modules": [], "api_summary": {}, "decoded_strings": []}
+            existing = set(report_dict.get("modules") or [])
+            for n in loaded_from_stdout:
+                if n not in existing:
+                    existing.add(n)
+                    report_dict.setdefault("modules", []).append(n)
+
+        return (
+            result.returncode,
+            stdout_str,
+            result.stderr or "",
+            report_dict,
+        )
+
+
+def run_cwe_checker(file_path: Path) -> Dict[str, Any]:
+    """
+    Run cwe_checker (fkiecad/cwe_checker) in Docker on the given binary/dump file.
+    Command: cwe_checker /target/file --json.
+    Returns dict with keys: findings (list), error (str or None), return_code (int).
+    """
+    import json as _json
+    host_path = Path(file_path)
+    if not host_path.exists():
+        return {"findings": [], "error": "file_not_found", "return_code": -1}
+    mount_src = _host_path_for_docker_mount(host_path.parent)
+    container_path = f"/target/{host_path.name}"
+    mount = f"{mount_src}:/target:ro"
+    cmd = [
+        "docker", "run", "--rm", "--network", "none",
+        "-v", mount,
+        CWE_CHECKER_IMAGE,
+        container_path, "--json",
+    ]
+    timeout = 300
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"findings": [], "error": f"timeout_{timeout}s", "return_code": -1}
+    except Exception as e:
+        return {"findings": [], "error": str(e), "return_code": -1}
+    stdout_str = (result.stdout or "").strip()
+    stderr_str = (result.stderr or "").strip()
+    findings: List[Dict[str, Any]] = []
+    if stdout_str:
+        try:
+            data = _json.loads(stdout_str)
+            if isinstance(data, list):
+                findings = data
+            elif isinstance(data, dict):
+                findings = data.get("results", data.get("findings", data.get("data", [])))
+                if not isinstance(findings, list):
+                    findings = [data] if data else []
+            else:
+                findings = []
+        except Exception:
+            pass
+    out = {"findings": findings, "error": None if result.returncode == 0 else (stderr_str[:500] or f"exit_{result.returncode}"), "return_code": result.returncode}
+    if stderr_str and result.returncode != 0 and not out["error"]:
+        out["error"] = stderr_str[:500]
+    return out
 
 
 # Startup validation

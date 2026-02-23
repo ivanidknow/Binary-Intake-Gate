@@ -14,9 +14,51 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass, field
 import os
+import sys
 import json
 import tempfile
 import hashlib
+import threading
+
+_emu_log_lock = threading.Lock()
+_last_dump_reason: str = ""
+
+
+def get_last_dump_reason() -> str:
+    """Return the last dump failure reason (for CLI to log when no dump path)."""
+    return _last_dump_reason
+
+
+def _emu_log(msg: str) -> None:
+    """Append one line to cli_debug.log (file only so it works from any process/thread)."""
+    line = f"[emu_dbg] {msg}\n"
+    with _emu_log_lock:
+        # Try multiple path candidates so log is written even if cwd differs
+        candidates = []
+        if os.environ.get("BIN_GATE_DEBUG_LOG"):
+            candidates.append(os.path.abspath(os.environ["BIN_GATE_DEBUG_LOG"]))
+        candidates.append(os.path.abspath("cli_debug.log"))
+        candidates.append(os.path.join(os.getcwd(), "cli_debug.log"))
+        try:
+            if getattr(sys, "frozen", False):
+                candidates.append(os.path.join(os.path.dirname(sys.executable), "cli_debug.log"))
+        except Exception:
+            pass
+        for log_path in candidates:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+                    f.flush()
+                return
+            except Exception:
+                continue
+        try:
+            out = getattr(sys, "stdout", None)
+            if out is not None and getattr(out, "write", None):
+                out.write(line)
+                out.flush()
+        except Exception:
+            pass
 
 
 # Emulation timeout (seconds)
@@ -55,7 +97,19 @@ class EmulationResult:
     
     # Memory dump path (image base + mapped pages written to .dmp for CVE/SBOM)
     memory_dump_path: Optional[str] = None
-    
+    # When memory_dump_path is None, reason for failure (for logging)
+    dump_failure_reason: str = ""
+
+    # Loaded modules (LDR list) from Docker JSON report
+    modules: List[str] = field(default_factory=list)
+
+    # Per-module version/hash from !!!MODULE_INFO!!! (LIEF fingerprinting in container)
+    module_details: List[Dict[str, str]] = field(default_factory=list)
+    detailed_modules: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Docker raw stdout length (for orchestrate: emulation_insufficient_data when < 1000)
+    docker_stdout_length: int = 0
+
     # Timing
     elapsed_ms: int = 0
     instructions_executed: int = 0
@@ -167,46 +221,126 @@ def _summarize_api_calls(api_calls: List[Dict[str, Any]]) -> Dict[str, int]:
     return dict(sorted(summary.items(), key=lambda x: -x[1])[:50])
 
 
+def _set_dump_reason(reason: str) -> None:
+    global _last_dump_reason
+    _last_dump_reason = reason
+    _emu_log(f"dump: reason={reason}")
+
+
 def _dump_emulated_memory_to_file(se: Any, source_path: Path) -> Optional[str]:
     """
-    Dump emulated process memory (image base + mapped pages) to a temporary .dmp file.
-    Uses Speakeasy get_memory_dumps() when available.
-    Returns path to the .dmp file or None on failure.
+    Dump emulated process memory to a temporary .dmp file.
+    Tries: 1) get_memory_dumps() generator; 2) get_mem_maps() + mem_read() (required if 1 is empty).
+    Returns path to the .dmp file or None on failure. Sets _last_dump_reason on failure for CLI.
     """
+    global _last_dump_reason
+    _last_dump_reason = ""
+    dmp_path: Optional[str] = None
     try:
+        _emu_log("dump: starting extraction.")
+        # 1) Speakeasy: get_memory_dumps() -> generator of (tag, base, size, is_free, proc, data)
         get_dumps = getattr(se, "get_memory_dumps", None)
-        if not callable(get_dumps):
-            return None
-        dumps = get_dumps()
-        if not dumps:
-            return None
-        fd, dmp_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                if isinstance(dumps, dict):
-                    for _tag, data in sorted(dumps.items()):
-                        if isinstance(data, (bytes, bytearray)):
-                            f.write(data)
-                elif isinstance(dumps, (list, tuple)):
-                    for item in dumps:
-                        if isinstance(item, (bytes, bytearray)):
-                            f.write(item)
-                        elif isinstance(item, (list, tuple)) and len(item) >= 3:
-                            # (base, size, data) or similar
-                            data = item[-1]
+        _emu_log(f"dump: get_memory_dumps present={callable(get_dumps)}")
+        if callable(get_dumps):
+            dumps = get_dumps()
+            fd, dmp_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    written = 0
+                    blocks = 0
+                    for block in dumps:
+                        blocks += 1
+                        if isinstance(block, (list, tuple)) and len(block) >= 1:
+                            data = block[-1] if len(block) >= 3 else (block[0] if len(block) == 1 else None)
                             if isinstance(data, (bytes, bytearray)):
                                 f.write(data)
-                elif isinstance(dumps, (bytes, bytearray)):
-                    f.write(dumps)
-            return dmp_path
-        except Exception:
-            try:
-                os.unlink(dmp_path)
-            except Exception:
-                pass
-            return None
-    except Exception:
-        return None
+                                written += len(data)
+                        elif isinstance(block, (bytes, bytearray)):
+                            f.write(block)
+                            written += len(block)
+                    _emu_log(f"dump: get_memory_dumps blocks={blocks} written={written} path={dmp_path}")
+                    if written > 0:
+                        _emu_log(f"dump: bytes written: {written}.")
+                if written == 0:
+                    _set_dump_reason(f"get_memory_dumps empty (blocks={blocks} written=0)")
+                    try:
+                        os.unlink(dmp_path)
+                    except Exception:
+                        pass
+                    dmp_path = None
+                else:
+                    return dmp_path
+            except Exception as e:
+                _set_dump_reason(f"get_memory_dumps error: {e}")
+                _emu_log(f"dump: get_memory_dumps error={e}")
+                try:
+                    if dmp_path:
+                        os.unlink(dmp_path)
+                except Exception:
+                    pass
+                dmp_path = None
+        else:
+            _set_dump_reason("get_memory_dumps not available")
+
+        # 2) If get_memory_dumps() was empty, MUST use get_mem_maps(): all regions, mem_read, concatenate, write
+        if dmp_path is None and hasattr(se, "get_mem_maps") and hasattr(se, "mem_read"):
+            get_maps = getattr(se, "get_mem_maps", None)
+            mem_read = getattr(se, "mem_read", None)
+            if callable(get_maps) and callable(mem_read):
+                _emu_log("dump: fallback get_mem_maps + mem_read")
+                try:
+                    maps = get_maps()
+                    if not maps:
+                        _set_dump_reason((_last_dump_reason + "; " if _last_dump_reason else "") + "get_mem_maps returned empty list")
+                        _emu_log("dump: get_mem_maps returned empty")
+                    else:
+                        total_data = bytearray()
+                        regions_ok = 0
+                        regions_fail = 0
+                        for region in maps:
+                            base = region.get_base() if hasattr(region, "get_base") else getattr(region, "base", None)
+                            size = region.get_size() if hasattr(region, "get_size") else getattr(region, "size", None)
+                            if base is None or size is None or size <= 0:
+                                continue
+                            try:
+                                data = mem_read(base, size)
+                                if data:
+                                    total_data.extend(data)
+                                    regions_ok += 1
+                            except Exception as e:
+                                regions_fail += 1
+                                _emu_log(f"dump: mem_read region base={base} size={size} failed: {e}")
+                        _emu_log(f"dump: get_mem_maps regions_ok={regions_ok} regions_fail={regions_fail} bytes={len(total_data)}")
+                        if len(total_data) == 0:
+                            _set_dump_reason((_last_dump_reason + "; " if _last_dump_reason else "") + f"get_mem_maps read 0 bytes (regions_ok={regions_ok} regions_fail={regions_fail})")
+                            dmp_path = None
+                        else:
+                            _emu_log(f"dump: bytes written: {len(total_data)}.")
+                            fd, dmp_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
+                            try:
+                                with os.fdopen(fd, "wb") as f:
+                                    f.write(total_data)
+                                return dmp_path
+                            except Exception as e:
+                                _set_dump_reason((_last_dump_reason + "; " if _last_dump_reason else "") + f"get_mem_maps write error: {e}")
+                                _emu_log(f"dump: get_mem_maps write error={e}")
+                                try:
+                                    os.unlink(dmp_path)
+                                except Exception:
+                                    pass
+                                dmp_path = None
+                except Exception as e:
+                    _set_dump_reason((_last_dump_reason + "; " if _last_dump_reason else "") + f"get_mem_maps error: {e}")
+                    _emu_log(f"dump: get_mem_maps error={e}")
+            else:
+                _set_dump_reason((_last_dump_reason + "; " if _last_dump_reason else "") + "get_mem_maps/mem_read not callable")
+
+        if dmp_path is None and not _last_dump_reason:
+            _set_dump_reason("no method produced a dump")
+    except Exception as e:
+        _set_dump_reason(f"exception: {e}")
+        _emu_log(f"dump: exception={e}")
+    return None
 
 
 def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
@@ -224,8 +358,11 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
     try:
         import speakeasy
         from speakeasy import Speakeasy
-    except ImportError:
-        result.error = "speakeasy_not_installed"
+    except ImportError as e:
+        err = str(e).strip()
+        result.error = f"speakeasy_import_error: {err}"
+        if "dynamic library" in err.lower() or "dll" in err.lower():
+            result.error += " (hint: on Windows install VC++ Redistributable; ensure Python and pip are same arch 64-bit)"
         return result
     
     import time
@@ -330,11 +467,17 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
 
         # Dump emulated memory (image base + mapped pages) for CVE/SBOM on unpacked content
         if result.success:
+            _emu_log("dump: calling _dump_emulated_memory_to_file")
             result.memory_dump_path = _dump_emulated_memory_to_file(se, path)
+            if not result.memory_dump_path:
+                result.dump_failure_reason = get_last_dump_reason()
+            _emu_log(f"dump: result path={result.memory_dump_path}")
         
     except Exception as e:
         result.error = f"speakeasy_error:{str(e)[:200]}"
-    
+        if not result.memory_dump_path:
+            result.dump_failure_reason = get_last_dump_reason() or f"exception_before_or_during_dump: {e!r}"
+
     result.elapsed_ms = int((time.time() - start_time) * 1000)
     return result
 
@@ -408,6 +551,91 @@ def _run_unicorn_shellcode_emulation(data: bytes, arch: str = "x86") -> Emulatio
     return result
 
 
+def _run_speakeasy_emulation_via_docker(path: Path, timeout: int) -> EmulationResult:
+    """
+    Run Speakeasy emulation inside Docker (Linux image; use when local import fails e.g. on Windows).
+    Returns EmulationResult with memory_dump_path set if dump was produced.
+    """
+    result = EmulationResult()
+    try:
+        from ..docker_utils import (
+            check_docker_available,
+            image_exists,
+            build_emulation_image,
+            run_emulation_container,
+            EMULATION_IMAGE,
+        )
+    except ImportError:
+        result.error = "docker_utils_unavailable"
+        return result
+
+    if not check_docker_available(raise_on_fail=False).available:
+        result.error = "docker_unavailable"
+        return result
+
+    if not image_exists(EMULATION_IMAGE):
+        _emu_log("emulation docker: building image (first run)...")
+        ok, err = build_emulation_image()
+        if not ok:
+            result.error = f"emulation_image_build_failed: {err}"
+            return result
+
+    rc, stdout, stderr, report_dict = run_emulation_container(path, timeout=timeout)
+    if rc != 0:
+        result.error = f"emulation_docker_exit_{rc}"
+        if stderr:
+            result.error += f": {stderr[:200].strip()}"
+        return result
+
+    result.docker_stdout_length = len(stdout)
+    _emu_log(f"Docker RAW output length: {result.docker_stdout_length}. Looking for modules...")
+
+    # Parse JSON report from container (docker_utils uses r"!!!MODULE_LOADED!!!:.*?([\w\-. ]+\.dll)" for DLLs with weird separators): fill api_summary, decoded_strings, modules
+    if report_dict:
+        result.modules = list(report_dict.get("modules", [])) if isinstance(report_dict.get("modules"), list) else []
+        if report_dict.get("decoded_strings"):
+            result.decoded_strings = list(report_dict["decoded_strings"])[:500]
+        if isinstance(report_dict.get("api_summary"), dict):
+            result.api_summary = dict(report_dict["api_summary"])
+        result.module_details = list(report_dict.get("module_details") or [])
+        result.detailed_modules = list(report_dict.get("detailed_modules") or report_dict.get("module_details") or [])
+        n_strings = len(result.decoded_strings)
+        n_apis = len(result.api_summary) if isinstance(result.api_summary, dict) else 0
+        _emu_log(f"Docker report parsed: found {n_strings} strings and {n_apis} API calls.")
+
+    # Optional: parse Base64 dump if present (DUMP_BASE64_START/END). If no dump, success = having report/modules.
+    import base64
+    start_m = "DUMP_BASE64_START"
+    end_m = "DUMP_BASE64_END"
+    if start_m in stdout and end_m in stdout:
+        try:
+            i = stdout.index(start_m) + len(start_m)
+            j = stdout.index(end_m)
+            b64 = stdout[i:j].strip().replace("\n", "").replace("\r", "")
+            dump_bytes = base64.b64decode(b64)
+            if dump_bytes:
+                fd, stable_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
+                try:
+                    os.write(fd, dump_bytes)
+                    result.success = True
+                    result.memory_dump_path = stable_path
+                    _emu_log(f"emulation docker: dump {len(dump_bytes)} bytes -> {stable_path}")
+                finally:
+                    os.close(fd)
+        except Exception as e:
+            result.error = f"emulation_docker_decode: {e}"
+    if not result.success and report_dict:
+        # Structured JSON output only (no Base64): success = report + modules
+        result.success = True
+        _emu_log("emulation docker: no dump; success from !!!JSON_REPORT_START!!! / !!!MODULE_LOADED!!!")
+    if not result.success:
+        result.error = "emulation_docker_no_dump_in_stdout"
+        if stderr:
+            result.error += f": {stderr[:150].strip()}"
+
+    return result
+
+
 def run_emulation(
     path: Path,
     timeout: int = EMULATION_TIMEOUT_SEC,
@@ -459,10 +687,10 @@ def run_emulation(
     if file_type not in ("PE",):
         result_dict["error"] = f"unsupported_type:{file_type}"
         return result_dict
-    
-    # Run Speakeasy emulation
-    emu_result = _run_speakeasy_emulation(path, timeout)
-    
+
+    # Docker-only: no local Speakeasy fallback; container outputs JSON report + dump
+    emu_result = _run_speakeasy_emulation_via_docker(path, timeout)
+
     # Convert to dict format
     result_dict["success"] = emu_result.success
     result_dict["error"] = emu_result.error if emu_result.error else None
@@ -488,6 +716,20 @@ def run_emulation(
     }
     if emu_result.memory_dump_path:
         result_dict["memory_dump_path"] = emu_result.memory_dump_path
+    if getattr(emu_result, "modules", None):
+        result_dict["modules"] = list(emu_result.modules)
+    else:
+        result_dict["modules"] = []
+    result_dict["module_details"] = list(getattr(emu_result, "module_details", None) or [])
+    result_dict["detailed_modules"] = list(getattr(emu_result, "detailed_modules", None) or [])
+    result_dict["docker_stdout_length"] = getattr(emu_result, "docker_stdout_length", 0) or 0
+    # When no dump, always set a reason (from dataclass, global, or error before dump)
+    if not result_dict.get("memory_dump_path"):
+        result_dict["dump_failure_reason"] = (
+            getattr(emu_result, "dump_failure_reason", None)
+            or get_last_dump_reason()
+            or (f"emulation_error_before_dump: {emu_result.error}" if getattr(emu_result, "error", None) else "dump_emulated_memory_to_file did not set reason")
+        )
 
     return result_dict
 

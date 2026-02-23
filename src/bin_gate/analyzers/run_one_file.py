@@ -1,9 +1,24 @@
 # run_one_file.py — single-file analysis for ProcessPoolExecutor worker
 # Used by orchestrate: returns full evidence dict (no VT/CVE). Hard timeouts applied.
 from __future__ import annotations
+import os
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+_emu_log_lock = threading.Lock()
+
+
+def _emu_dbg(msg: str) -> None:
+    """Append a line to cli_debug.log for emulation debugging (worker-safe)."""
+    with _emu_log_lock:
+        try:
+            log_path = os.path.join(os.getcwd(), "cli_debug.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
 
 # Hard timeouts (seconds) so one binary cannot block the pipeline
 CAPA_TIMEOUT = int(__import__("os").getenv("CAPA_TIMEOUT_SEC", "120"))
@@ -398,14 +413,34 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
     out["script_analysis"] = None
     
     # --- Emulation (Speakeasy) ---
-    if opt("emulation", False) and kind == "PE" and not skip_heavy:
+    # Force emulation when VMProtect is detected (DIE/obfuscation) so CVE gets the memory dump even in batch mode
+    _force_emulation_vmprotect = False
+    die = out.get("die") or {}
+    if isinstance(die, dict):
+        for d in die.get("detects") or []:
+            if isinstance(d, str) and "vmprotect" in d.lower():
+                _force_emulation_vmprotect = True
+                break
+            if isinstance(d, dict) and "vmprotect" in (d.get("name") or d.get("sName") or "").lower():
+                _force_emulation_vmprotect = True
+                break
+    if not _force_emulation_vmprotect:
+        obf = out.get("obfuscation") or {}
+        if isinstance(obf, dict):
+            packers = obf.get("packer_families") or []
+            _force_emulation_vmprotect = any("vmprotect" in str(p).lower() for p in packers)
+    BIN_GATE_ENABLE_EMULATION = os.getenv("BIN_GATE_ENABLE_EMULATION", "")
+    _emu_dbg(f"[emu_dbg] Attempting emulation for {path}, enabled={BIN_GATE_ENABLE_EMULATION}, opt(emulation)={opt('emulation', False)}, kind={kind}, skip_heavy={skip_heavy}, force_vmprotect={_force_emulation_vmprotect}")
+    # VMProtect: ignore skip_heavy and run emulation so CVE can use .dmp
+    if (opt("emulation", False) or _force_emulation_vmprotect) and kind == "PE" and (not skip_heavy or _force_emulation_vmprotect):
         t_emu = time.perf_counter()
+        _emu_dbg(f"[emu_dbg] Starting emulation for {path} (force_vmprotect={_force_emulation_vmprotect})")
         try:
             from .emulation import run_emulation, merge_emulation_to_capa
             emu_timeout = int(opt("emulation_timeout", EMULATION_TIMEOUT))
             emu_max_mb = int(opt("emulation_max_mb", 50))
-            
-            if emu_max_mb <= 0 or (file_size <= emu_max_mb * 1024 * 1024):
+            # VMProtect: ignore size limit so we always get a dump
+            if _force_emulation_vmprotect or emu_max_mb <= 0 or (file_size <= emu_max_mb * 1024 * 1024):
                 emu_result = run_emulation(
                     path,
                     timeout=emu_timeout,
@@ -435,6 +470,17 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
                         for f in (emu_result.get("files") or {}).get(key) or []:
                             if isinstance(f, str) and f.strip():
                                 _emulation_deps.append({"type": "file_ref", "value": f.strip()[:500], "source": f"emulation_files_{key}"})
+                    # DLL names from emulation (right after emulation.run): for Grype injection when Syft returns 0
+                    _dll_pat = _re.compile(r"[a-zA-Z0-9_.\-]+\.dll", _re.IGNORECASE)
+                    _dll_seen: set = set()
+                    for _s in list((emu_result.get("api_summary") or {}).keys()) + (emu_result.get("decoded_strings") or []):
+                        if not isinstance(_s, str):
+                            continue
+                        for _m in _dll_pat.finditer(_s):
+                            _name = _m.group(0).strip()
+                            if len(_name) <= 256 and _name not in _dll_seen:
+                                _dll_seen.add(_name)
+                                _emulation_deps.append({"type": "dynamic_lib", "value": _name, "source": "emulation_speakeasy_strings"})
                     if _emulation_deps:
                         out.setdefault("supply_chain", {}).setdefault("dependencies", []).extend(_emulation_deps)
         except Exception as e:
