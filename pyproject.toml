@@ -16,6 +16,7 @@ dependencies = ["python-dotenv>=1.0.0"]
 
 [project.scripts]
 bin-gate = "bin_gate.cli:main"
+bin-gate-rules-sync = "bin_gate.rules.updater:main"
 
 [project.optional-dependencies]
 # для разбора Python-пакетов (wheel/sdist), Requires-Dist и пр.
@@ -23,6 +24,9 @@ pythonpkg = ["packaging>=24.1"]
 
 # статический анализ Python-кода
 sast = ["bandit>=1.7.9"]
+
+# v3.0: декомпиляция .pyc для AST-анализа (eval/exec/os.system)
+python-bytecode = ["uncompyle6>=3.8.0"]
 
 # асинхронные VT/API (batch lookup)
 async = ["httpx>=0.24"]
@@ -41,6 +45,9 @@ advanced = [
     "requests>=2.32",
 ]
 
+# QA / тесты
+test = ["pytest>=7.0", "pefile>=2023.2.7"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
@@ -55,3 +62,9 @@ include = ["bin_gate*"]
 #   "capa-rules/**",
 #   "policy/*.yaml"
 # ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-v --tb=short"
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,185 +1,198 @@
-Binary Intake Gate
+# Binary Intake Gate
 
-A single gateway to assess PE/ELF binaries in PRs and releases. Performs fast static due-diligence: hashes & entropy, hardening checks (PE/ELF), signature/chain (PE), YARA, capa, VirusTotal hash lookup (optional upload), CVE discovery via OSV, profile-based policy (dev/staging/prod), and clean, human-friendly reports (plus optional SARIF).
+**Fast Binary Ingest Filter with 85+ MITRE ATT&CK Techniques coverage.**
 
-Stack: Python 3.10+ · yara-python, pefile, lief, pyelftools, capa (CLI), requests, sqlite3 (cache), a CEL-style safe policy engine, OSV API, and (optional) Playwright for VT UI uploads.
+Единая точка контроля для оценки бинарных файлов и пакетов при приёме в репозиторий, в PR и при релизах. Быстрая статическая проверка (due-diligence) без обязательного запуска кода, с политиками по профилям (dev/staging/prod) и отчётами в Markdown, человекочитаемом виде (RU) и SARIF.
 
-Features
+---
 
-🧾 Identity & Integrity: SHA-256, file/section entropy, basic magic/MIME.
+## 1. Зачем эта тулза и кому она подойдёт
 
-🛡️ Hardening checks:
+**Зачем:** перед допуском артефактов в сборку или прод нужно быстро ответить: файл подписан и без известных уязвимостей? Нет ли признаков упаковки, обфускации, маскировки под документ? Нет ли секретов, вредоносных сигнатур или отозванной подписи? Binary Intake Gate даёт один запуск по файлу или директории и на выходе — вердикт (allow / warn / deny), уровень риска 0–100 и обоснование.
 
-PE: ASLR / DEP / CFG, Authenticode (presence/chain/timestamp), sections (RWX/overlay).
+**Кому подойдёт:**
 
-ELF: PIE / NX / RELRO / Canary, RPATH/RUNPATH/TEXTREL.
+- **DevSecOps / SRE** — встроить шлюз в пайплайн приёма бинарников и инсталляторов (PE, ELF, MSI, архивы); выход в CI по коду возврата и SARIF.
+- **Security-команды** — проверка hardening (ASLR, DEP, CFG, HVCI), подписей и отзыва сертификатов, поиск секретов и CVE по SBOM.
+- **Аналитики** — YARA, DIE, опционально capa и эмуляция; репутация через VirusTotal; человекочитаемый отчёт на русском с обоснованием вердикта.
 
-🧬 Signatures & behavior: YARA (your rules + built-ins), capa (techniques/rules).
+Офлайн-режим (`--no-network`) и кэш по SHA-256 позволяют использовать тулзу в изолированных средах.
 
-🧭 VirusTotal reputation: hash lookup (detections, reputation, sandbox refs). Upload is opt-in.
+---
 
-🐧/🪟 CVE for external libs: via OSV API.
+## 2. Методики и средства
 
-ELF: NEEDED → distro package (Debian/Ubuntu/Alpine/RedHat) with summarised CRITICAL/HIGH/MEDIUM/LOW.
+Ниже — что проверяется и какими инструментами это делается.
 
-PE: best-effort from VersionInfo/DLL versions.
+| Область | Методика | Средство |
+|--------|----------|----------|
+| **Идентификация и целостность** | Хэши (SHA-256, MD5), энтропия файла/секций | Встроено (hashes, entropy) |
+| **Hardening (PE)** | ASLR, DEP, CFG, HighEntropyVA, SafeSEH, CET (IBT/Shadow Stack), Load Config | pefile, `pe_hardening.py` |
+| **Hardening (PE, Enterprise)** | HVCI (/INTEGRITYCHECK, W^X, релокации), WDAC/AppLocker bypass (LOLBins, эвристики загрузчика) | `pe_hardening.py` |
+| **Hardening (ELF)** | PIE, NX, RELRO, Canary, RPATH/RUNPATH, CET | pyelftools, `elf_checksec.py` |
+| **Подпись (PE)** | Наличие Authenticode, цепочка, метка времени | PowerShell (Windows), `signing_trust.py` |
+| **Отзыв сертификата** | OCSP-проверка при наличии подписи | `signing_trust.py` (cryptography), скоринг +100 при revoked |
+| **Проверка цепочки (не-Windows)** | Верификация Authenticode без PowerShell | osslsigncode |
+| **Упаковщики / протекторы** | Детекция упаковщиков, компиляторов, VMProtect и др. | Docker: Detect It Easy (`horsicq/detectiteasy`) |
+| **Сигнатуры и техники** | YARA (в т.ч. внешние базы Yara-Rules, Neo23x0), техники ATT&CK из метаданных | yara-python, `yara_scan.py`, `rules/updater.py` |
+| **Глубокий анализ техник** | capa (по умолчанию выключен) | capa CLI, `--deep-capa` |
+| **CVE по зависимостям** | SBOM → сканирование уязвимостей | Docker: Syft + Grype (`anchore/syft`, `anchore/grype`) |
+| **Binary SCA (CWE)** | Статический анализ кода на CWE (buffer overflows, UAF и др.) | Docker: `fkiecad/cwe_checker` |
+| **Поиск секретов** | Паттерны AWS, GitHub, Slack, ключи и т.д.; в т.ч. в оверлее PE | Gitleaks (Docker, `zricethezav/gitleaks`) + regex fallback |
+| **Репутация** | Детекции, песочница, поведения по хэшу | VirusTotal API (опционально Playwright для загрузки) |
+| **Политика и риск** | Правила CEL-стиля, пороги deny/warn, числовой риск 0–100, обоснование блокировки | `policy/engine.py`, `scoring.py` |
+| **Эмуляция (опционально)** | Запуск PE в Speakeasy, дамп памяти, YARA/CVE по дампу | speakeasy-emulator или Docker-образ `bin-gate-emulation` |
+| **Отчёты** | Краткий MD, человекочитаемый (RU) с обоснованием вердикта, HVCI/WDAC, секреты, CWE, SARIF | `reporters/` |
 
-📜 Policies & profiles: allow/warn/deny with explainable reasons; CEL-style expressions; thresholds per profile.
+Docker используется для DIE, Syft, Grype, CWE checker и Gitleaks; при недоступности демона сканирование завершается с ошибкой (Hard Fail). Локальная эмуляция и capa опциональны.
 
-🧑‍💻 Reports:
+---
 
-report.md — concise summary;
+## 3. Что нужно для сборки и как использовать
 
-human_report.md — human-friendly narrative (RU locale);
+### Требования
 
-optional SARIF for code-scanning platforms.
+- **Python** 3.10+ (рекомендуется 3.10–3.13)
+- **Docker** — обязателен для DIE (Detect It Easy), CWE checker, CVE (Syft/Grype), Gitleaks
+- **VirusTotal API Key** — опционально; для репутации и поведений по хэшу (переменная `VT_API_KEY` или `.env`)
+- Опционально: capa (при `--deep-capa`), Playwright (для VT UI upload), oletools (глубокий разбор Office/макросов), speakeasy-emulator (локальная эмуляция)
 
-🧩 Cache & offline: SQLite by SHA-256; --no-network guarantees zero outbound requests.
+### Сборка
 
-Installation
-git clone https://github.com/<you>/binary-intake-gate.git
-cd binary-intake-gate
+**Вариант A — только установка пакета (рекомендуется для разработки):**
 
-# Install the CLI
+```bash
+git clone <repo>
+cd bin_intake_gateway
 pip install -e .
+# опционально: pip install -e ".[test]"   # для pytest
+# опционально: pip install -e ".[emulation,oletools,visual,threatintel]"
+```
 
-# (optional) Playwright for VT UI uploads
-# playwright install chromium
+После установки доступны команды `bin-gate` и `bin-gate-rules-sync`.
 
+**Вариант B — полная сборка (Windows, PowerShell):**
 
-Optional resources
+Скрипт `build.ps1` собирает все компоненты:
 
-capa rules: provide via --capa-rules or CAPA_RULES_DIR.
+1. **Python-пакет** — wheel в `dist/`, установка в режиме editable.
+2. **bin-gate.exe** — один исполняемый файл в корне проекта (PyInstaller).
+3. **Docker-образ эмуляции** — `bin-gate-emulation:latest` (если Docker доступен).
 
-YARA rules: provide via --yara-rules or YARA_RULES_DIR.
+```powershell
+.\build.ps1
+```
 
-VT API key: set VT_API_KEY for hash lookups (and API upload).
+В конце выводится итог: package, exe, Docker-образ. Запуск: `.\bin-gate.exe scan <путь>` или `bin-gate scan <путь>`.
 
-Quick start (copy-paste)
-1) Minimal (offline, no network)
-bin-gate scan examples \
+**Синхронизация внешних YARA-правил (опционально):**
+
+```bash
+bin-gate-rules-sync --sync
+# или: python -m bin_gate.rules.updater --sync
+```
+
+Требуются `git` и сеть; правила попадают в `src/bin_gate/rules/external/`.
+
+### Быстрый старт
+
+**Минимальный запуск (офлайн, без сети):**
+
+```bash
+bin-gate scan ./examples \
   --policy policy/policy.example.yaml \
   --no-network \
   --out report.md --human-out human_report.md
+```
 
-2) With capa + YARA
-bin-gate scan examples \
-  --capa-rules ./capa-rules --capa-timeout 120 \
-  --yara-rules ./yara-rules \
+**С VirusTotal (только lookup по хэшу):**
+
+```bash
+export VT_API_KEY=...   # Windows PowerShell: $env:VT_API_KEY="..."
+bin-gate scan ./examples \
   --policy policy/policy.example.yaml \
   --out report.md --human-out human_report.md
+```
 
-3) With VirusTotal (hash lookup only)
-export VT_API_KEY=...   # (PowerShell: $env:VT_API_KEY="...")
-bin-gate scan examples \
+**С CVE (Syft + Grype через Docker):**
+
+```bash
+bin-gate scan ./examples \
   --policy policy/policy.example.yaml \
   --out report.md --human-out human_report.md
+# Перед первым CVE-сканом: bin-gate cve-update
+```
 
-4) Optional: VT upload (UI/API)
-bin-gate scan examples \
-  --vt-upload --vt-upload-mode auto \
-  --policy policy/policy.example.yaml \
-  --out report.md --human-out human_report.md
+**Проверка готовности Docker и образов:**
 
+```bash
+bin-gate cve-check
+bin-gate cve-check --pull   # подтянуть недостающие образы
+```
 
-Upload happens only if the hash is unknown. Use with consent for non-public binaries.
+### Основные флаги
 
-5) CVE for dependencies (ELF/PE)
-bin-gate scan examples \
-  --cve-ecosystem Debian \
-  --cve-inventory ./inventory.json \
-  --policy policy/policy.example.yaml \
-  --out report.md --human-out human_report.md
+| Назначение | Флаги |
+|------------|--------|
+| Политика и профиль | `--policy FILE`, `--profile dev\|staging\|prod` |
+| Офлайн | `--no-network` |
+| Отчёты | `--out report.md`, `--human-out human_report.md`, `--sarif-out file.sarif.json` |
+| Вердикт и выход | `--fail-on none\|warn\|deny` |
+| CVE | `--no-cve`, `--no-cve-update`, `--cve-timeout N` |
+| DIE | `--no-die`, `--die-timeout N` |
+| YARA | `--no-yara`, `--yara-rules DIR`, `--yara-timeout N` |
+| capa | `--no-capa`, `--deep-capa`, `--capa-timeout N` |
+| VirusTotal | `--no-vt`, `--vt-upload` (opt-in) |
+| Эмуляция | `--emulation`, `--emulation-timeout N` |
 
+Полный список: `bin-gate scan --help`.
 
-inventory.json is an array of {ecosystem,name,version} representing installed packages of your image/host.
-ELF package resolution is tunable via --cve-resolve (auto|dpkg|rpm|apk|pacman|none).
+### Конфигурация (.env)
 
+Скопируйте `.env.example` в `.env` и при необходимости задайте:
 
-**Common flags**
+- `VT_API_KEY` — для VirusTotal
+- `BIN_GATE_PROFILE` — профиль по умолчанию (dev)
+- `BIN_GATE_GITLEAKS` — 1/0 (включить/выключить Gitleaks для секретов)
+- `BIN_GATE_PROJECT_ROOT` — корень проекта (для отчёта Gitleaks и логов)
 
-* Policy & profile: --policy policy/policy.example.yaml, --profile dev|staging|prod
-* Offline/cache: --no-network, --cache-db path/to/cache.sqlite
-* capa: --no-capa, --capa-rules DIR, --capa-timeout 120, --capa-max-mb N
-YARA: --no-yara, --yara-rules DIR, --yara-timeout 7, --yara-max-hits 80
-VirusTotal: --no-vt, --vt-upload, --vt-upload-mode auto|api|ui, --vt-ttl-hours 168
-CVE/OSV: --no-cve, --cve-ecosystem Debian|Ubuntu|Alpine|RedHat, --cve-inventory FILE, --cve-resolve auto
-Reports: --out report.md, --human-out human_report.md, --sarif-out artifacts/bin-gate.sarif.json
-Fail level: --fail-on none|warn|deny (exit code 1 at/over the level)
+Остальные переменные см. в `.env.example` и в `CURSOR.md`.
 
-**Policy format (CEL-style)**
+---
 
-Policies are YAML with profiles and rules. Expressions support and/or/not, comparisons, in, and safe dotted access to pe.*, elf.*, vt.*, yara_families, capa_tactics, cve.*, meta.profile.
+## Отчёты
 
-version: 2
+- **report.md** — краткая сводка по файлам (хэши, hardening, YARA/DIE, VT, CVE, решение политики).
+- **human_report.md** — развёрнутый отчёт (RU): уровень риска, обоснование вердикта, HVCI-совместимость, предупреждения WDAC/AppLocker, поиск секретов, CWE, матрица MITRE ATT&CK, при эмуляции — блок по дампу памяти.
+- **SARIF** — для интеграции с платформами статического анализа (например, GitHub Code Scanning).
 
-profiles:
-  dev:     { thresholds: { deny: 80, warn: 40 } }
-  staging: { thresholds: { deny: 80, warn: 40 } }
-  prod:    { thresholds: { deny: 80, warn: 40 } }
+### Пример человекочитаемого отчёта (Human Report) при вердикте DENY
 
-rules:
-  - id: vt-high-mal
-    when: vt and vt.detections and vt.detections.stats.malicious >= 5
-    then: deny
-    reason: VT malicious detections ≥ 5
+При блокировке файла (risk ≥ порога deny) в отчёте выводится блок **ПРОВЕРКА** с уровнем риска и обоснованием:
 
-  - id: elf-weak
-    when: elf and ((elf.hardening.pie == false) or (elf.hardening.nx == false))
-    score: 40
-    reason: ELF hardening weak (PIE/NX)
+```markdown
+# ПРОВЕРКА
 
-  - id: pe-no-cfg
-    when: pe and pe.hardening and pe.hardening.cfg == false
-    score: 30
-    reason: PE: CFG disabled
+Уровень риска: 100 (критический)
+████████████████████████████████████████ 100%
 
-  - id: cve-critical
-    when: cve and cve.summary and cve.summary.critical > 0
-    then: deny
-    reason: Known critical CVEs in dependencies
+## Обоснование вердикта
 
+Заблокировано: обнаружена вредоносная сигнатура в дампе памяти (YARA); критическое несоответствие: файл маскируется под документ, являясь исполняемым; отсутствие hardening (ASLR/DEP/CFG); нет цифровой подписи.
 
-The engine produces allow | warn | deny with human-readable reasons. The human report includes mitigation suggestions for warn/deny.
+Вредоносное ПО в памяти: Да, Секреты: Нет, Маскировка: Да, Уязвимости: Нет. Причины: КРИТИЧЕСКАЯ УГРОЗА: обнаружена сигнатура вредоносного ПО в дампе памяти; ...
+```
 
-**Stack:** Python3.13|capa/yara-python/lief/pefile/pyelftools, VT SDK, checksec, scipy, cel-python, sqlite
+Обоснование собирается из `scoring_reasons` и `build_deny_justification`; причины, связанные с дампом памяти и маскировкой, выводятся первыми.
 
-**Contributing**
+---
 
-PRs and issues are welcome: bug fixes, new YARA/capa rules, ELF→package mappers, policy profiles.
+## Платформы
 
-**Troubleshooting**
+Windows и Linux (x86_64). Для полного функционала нужен Docker; capa и Playwright (VT UI) опциональны.
 
-* capa finds no rules: set --capa-rules to your local capa-rules clone.
-* YARA shows no hits but you expect matches: verify --yara-rules path and rule compilation.
-* capa hangs: raise/limit with --capa-timeout or disable with --no-capa to isolate.
-* OSV/CVE returns nothing: provide --cve-inventory and a correct --cve-ecosystem.
-* Playwright UI upload won’t start: run playwright install chromium and try --vt-ui-headed if captcha appears.
+---
 
-**Platform support**
+## Лицензия и контрибьюция
 
-Windows & Linux (x86_64).
-capa/YARA require their respective binaries/bindings; VT UI upload requires Playwright browser to be installed.
-
-**Privacy & safety**
-
-By default the tool does not perform any network requests (--no-network enforces it strictly).
-
-VirusTotal upload is opt-in (--vt-upload) and only triggered when the hash is unknown.
-Ensure you have permission to upload non-public binaries.
-
-SQLite cache stores aggregated results keyed by SHA-256 only.
-
-**Configuration & env**
-
-* BIN_GATE_PROFILE — default profile (dev)
-* CAPA_RULES_DIR — path to capa rules
-* YARA_RULES_DIR — path to YARA rules
-* VT_API_KEY — VirusTotal key
-* YARA_TIMEOUT_SEC, CAPA_TIMEOUT_SEC, CVE_ECOSYSTEM, CVE_INVENTORY, … — see --help
-
-**Reports**
-
-* report.md — per-file summary (hashes, hardening, YARA/capa, VT, CVE, policy decision).
-* human_report.md — narrative report (currently RU locale) with bold markers: Outcome / Reasons / Recommended inside Verification blocks.
-* *.sarif.json — optional SARIF v2.1.0 for code-scanning.
+См. файл LICENSE. PR и issues приветствуются: исправления, новые правила YARA/capa, доработки политик и профилей.

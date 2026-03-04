@@ -59,7 +59,9 @@ def extract_metadata(file_path: str) -> tuple:
 
 
 def main():
-    input_file = os.environ.get("INPUT_FILE", "").strip()
+    input_file = os.environ.get("INPUT_FILE") or (sys.argv[1] if len(sys.argv) > 1 else None)
+    if input_file and isinstance(input_file, str):
+        input_file = input_file.strip()
     timeout = int(os.environ.get("TIMEOUT", "60"))
     report_path = os.environ.get("WRITE_REPORT", "/tmp/report.json")
 
@@ -80,19 +82,23 @@ def main():
 
     try:
         try:
-            se = Speakeasy(debug=True)
+            se = Speakeasy(debug=False)
         except TypeError:
             se = Speakeasy()
             if hasattr(se, "set_debug"):
                 try:
-                    se.set_debug(True)
+                    se.set_debug(False)
                 except Exception:
                     pass
             elif hasattr(se, "debug"):
                 try:
-                    se.debug = True
+                    se.debug = False
                 except Exception:
                     pass
+        try:
+            se.set_max_instructions(1000000)
+        except Exception:
+            pass
         # Aggressive analysis: scavenge strings and high API count (VMProtect etc.)
         try:
             cfg = getattr(se, "config", None) or getattr(se, "cfg", None)
@@ -100,10 +106,21 @@ def main():
                 if hasattr(cfg, "set"):
                     cfg.set("analysis", "strings", True)
                     cfg.set("analysis", "max_api_count", 5000)
+                    # Увеличение лимита памяти и стека для распаковщиков (MPRESS/UPX) — снижает UC_ERR_WRITE_UNMAPPED
+                    try:
+                        cfg.set("memory", "limit_memory", 256 * 1024 * 1024)
+                    except Exception:
+                        pass
+                    try:
+                        cfg.set("memory", "stack_size", 2 * 1024 * 1024)
+                    except Exception:
+                        pass
                 elif isinstance(cfg, dict):
                     cfg["analysis"] = cfg.get("analysis") or {}
                     cfg["analysis"]["strings"] = True
                     cfg["analysis"]["max_api_count"] = 5000
+                    cfg.setdefault("memory", {})["limit_memory"] = 256 * 1024 * 1024
+                    cfg.setdefault("memory", {})["stack_size"] = 2 * 1024 * 1024
         except Exception:
             pass
         module = se.load_module(input_file)
@@ -117,12 +134,15 @@ def main():
             if n and n not in loaded_modules:
                 loaded_modules.append(n)
 
-        # Scavenge strings BEFORE execution in case it crashes (deep memory scan for .dll)
+        # Pre-run dump: снимаем дамп памяти сразу после успешного load_module и передаём в stdout
+        # (для Deep Memory Scan на хосте; при падении run_module дамп всё равно уходит в except ниже)
+        _pre_run_dump = None
         if hasattr(se, "get_mem_maps") and hasattr(se, "mem_read"):
             get_maps = getattr(se, "get_mem_maps", None)
             mem_read = getattr(se, "mem_read", None)
             if callable(get_maps) and callable(mem_read):
                 try:
+                    total = bytearray()
                     for entry in get_maps():
                         try:
                             base = entry.get_base() if hasattr(entry, "get_base") else getattr(entry, "base", None)
@@ -132,6 +152,7 @@ def main():
                             data = mem_read(base, size)
                             if not data:
                                 continue
+                            total.extend(data)
                             found = re.findall(rb"[A-Za-z0-9_\\.\-]+\.[Dd][Ll][Ll]", data)
                             for dll_bytes in found:
                                 try:
@@ -143,20 +164,55 @@ def main():
                                     continue
                         except Exception:
                             continue
+                    if total:
+                        _pre_run_dump = bytes(total)
                 except Exception as e:
                     print(f"WARN: get_mem_maps scavenge: {e}", file=sys.stderr)
 
         try:
-            se.run_module(module, timeout=timeout, max_instructions=10_000_000)
+            se.debug = False
+        except Exception:
+            pass
+        try:
+            se.run_module(module, timeout=timeout, max_ins=1000000)
         except TypeError:
             try:
-                se.run_module(module, max_instructions=10_000_000)
+                se.run_module(module, max_instructions=1000000)
             except TypeError:
                 se.run_module(module)
     except Exception as e:
         print(f"ERROR: emulation failed: {e}", file=sys.stderr)
         report["error"] = str(e)[:500]
         _write_report(report_path, report)
+        # Pre-run dump (loaded image with EICAR) if we have it; else try get_mem_maps again
+        import base64
+        to_dump = _pre_run_dump
+        if not to_dump and hasattr(se, "get_mem_maps") and hasattr(se, "mem_read"):
+            get_maps = getattr(se, "get_mem_maps", None)
+            mem_read = getattr(se, "mem_read", None)
+            if callable(get_maps) and callable(mem_read):
+                try:
+                    total = bytearray()
+                    for entry in get_maps():
+                        try:
+                            base = entry.get_base() if hasattr(entry, "get_base") else getattr(entry, "base", None)
+                            size = entry.get_size() if hasattr(entry, "get_size") else getattr(entry, "size", None)
+                            if base is None or size is None or size <= 0:
+                                continue
+                            data = mem_read(base, size)
+                            if data:
+                                total.extend(data)
+                        except Exception:
+                            continue
+                    if total:
+                        to_dump = bytes(total)
+                except Exception as dump_err:
+                    print(f"WARN: dump on failure: {dump_err}", file=sys.stderr)
+        if to_dump:
+            b64 = base64.b64encode(to_dump).decode("ascii")
+            print("DUMP_BASE64_START", flush=True)
+            sys.stdout.write(b64)
+            print("\nDUMP_BASE64_END", flush=True)
         sys.exit(1)
 
     # Collect all loaded module names
@@ -197,6 +253,24 @@ def main():
     report["modules"] = loaded_modules
     report["api_summary"] = api_summary
     report["decoded_strings"] = decoded_strings
+
+    # Output pre-run memory dump (loaded image) for host Deep Memory Scan
+    if _pre_run_dump:
+        try:
+            import base64
+            b64 = base64.b64encode(_pre_run_dump).decode("ascii")
+            print("DUMP_BASE64_START", flush=True)
+            sys.stdout.write(b64)
+            print("\nDUMP_BASE64_END", flush=True)
+        except Exception as dump_err:
+            print(f"WARN: pre-run dump output: {dump_err}", file=sys.stderr)
+
+    # Dump memory before script exits (for host-side CVE/dump analysis)
+    if hasattr(se, "dump_memory") and callable(getattr(se, "dump_memory")):
+        try:
+            se.dump_memory()
+        except Exception as e:
+            print(f"WARN: dump_memory: {e}", file=sys.stderr)
 
     # Critical fallback: if module list is still empty, manual DLL search in memory strings
     if not report.get("modules") and hasattr(se, "get_strings"):

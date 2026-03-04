@@ -1,5 +1,6 @@
 # src/bin_gate/reporters/human.py
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import re
@@ -835,12 +836,34 @@ def _vt_behaviour_list(vt: Dict[str, Any]) -> List[Dict[str, Any]]:
                 out.append(it)
     return out
 
-def _vt_behaviour_blocks(vt: Dict[str, Any], max_items: int = 15) -> List[str]:
+def _norm_registry_key(s: str) -> str:
+    """Нормализация ключа реестра для сопоставления с VT verified."""
+    if not s or not isinstance(s, str):
+        return ""
+    return s.lower().replace("/", "\\").strip()
+
+
+def _norm_network_ioc(s: str) -> str:
+    """Нормализация домена/IP/URL для сопоставления с VT verified."""
+    if not s or not isinstance(s, str):
+        return ""
+    return s.lower().strip()
+
+
+def _vt_behaviour_blocks(
+    vt: Dict[str, Any],
+    max_items: int = 15,
+    vt_verified_registry: Optional[set] = None,
+    vt_verified_network: Optional[set] = None,
+) -> List[str]:
     """
     Рендерит поведение VT по блокам: Processes/Commands/Network/Files/Registry/Mutexes/MITRE.
     Объединяет поля из разных представлений (summary.*, корень, а также "vt.py-стиль").
+    Для подтверждённых VT событий (совпадение с локальными находками) добавляет [VT Verified].
     Возвращает список строк. Ничего не пишет в stdout/файлы.
     """
+    vt_verified_registry = vt_verified_registry or set()
+    vt_verified_network = vt_verified_network or set()
 
     def _pick_strings(seq, n) -> List[str]:
         res: List[str] = []
@@ -977,14 +1000,19 @@ def _vt_behaviour_blocks(vt: Dict[str, Any], max_items: int = 15) -> List[str]:
     if cmds:
         lines.append(f"* Команды:* {', '.join(cmds)}")
 
+    def _verified_net(t: str) -> str:
+        return f"{t} [VT Verified]" if vt_verified_network and _norm_network_ioc(t) in vt_verified_network else t
+    def _verified_reg(t: str) -> str:
+        return f"{t} [VT Verified]" if vt_verified_registry and _norm_registry_key(t) in vt_verified_registry else t
+
     doms = _pick_strings(agg["network_domains"], max_items)
     ips  = _pick_strings(agg["network_ips"],     max_items)
     urls = _pick_strings(agg["network_urls"],    max_items)
     if doms or ips or urls:
         line = "* Сеть:* "
-        if doms: line += f"домены={', '.join(doms)}; "
-        if ips:  line += f"ip={', '.join(ips)}; "
-        if urls: line += f"urls/http={', '.join(urls)}; "
+        if doms: line += f"домены={', '.join(_verified_net(d) for d in doms)}; "
+        if ips:  line += f"ip={', '.join(_verified_net(i) for i in ips)}; "
+        if urls: line += f"urls/http={', '.join(_verified_net(u) for u in urls)}; "
         lines.append(line.rstrip("; "))
 
     fz = _pick_strings(agg["files"], max_items)
@@ -993,7 +1021,7 @@ def _vt_behaviour_blocks(vt: Dict[str, Any], max_items: int = 15) -> List[str]:
 
     reg = _pick_strings(agg["registry"], max_items)
     if reg:
-        lines.append(f"* Реестр:* {', '.join(reg)}")
+        lines.append(f"* Реестр:* {', '.join(_verified_reg(r) for r in reg)}")
 
     mx = _pick_strings(agg["mutexes"], max_items)
     if mx:
@@ -1244,6 +1272,208 @@ def _worst_decision(children):
 def _iter_groups(groups: dict[str, list]) -> list[tuple[str, list]]:
     return sorted(groups.items(), key=lambda kv: (-len(kv[1]), str(kv[0] or "")))
 
+
+# Пороги для группировки по типам угроз (экспертное резюме)
+ENTROPY_OBF_THRESHOLD = 7.2
+OBF_STRINGS_THRESHOLD = 10000
+
+
+def _build_threat_groups(evidences: list) -> dict[str, list]:
+    """
+    Строит группы файлов по типам угроз для экспортного резюме:
+    group_obfuscated, group_rootkit, group_suspicious_scripts, group_clean.
+    """
+    group_obfuscated: list = []
+    group_rootkit: list = []
+    group_suspicious_scripts: list = []
+    group_clean: list = []
+
+    for ev in evidences:
+        name = _basename(_get(ev, "path") or _get(ev, "file") or _get(ev, "meta.name")) or "(файл)"
+        path_lower = (ev.get("path") or ev.get("file") or "").lower()
+        sfx = path_lower.rsplit(".", 1)[-1] if "." in path_lower else ""
+        kind = _kind_of(ev)
+
+        # Энтропия и объём восстановленных строк
+        ent = ev.get("entropy") or {}
+        file_ent = float(ent.get("file") or 0) if isinstance(ent, dict) else 0.0
+        obf = ev.get("obfuscation") or {}
+        max_ent = float(obf.get("max_section_entropy") or 0) if isinstance(obf, dict) else 0.0
+        entropy_val = max(file_ent, max_ent)
+        obf_count = int(obf.get("recovered_strings_count") or 0) if isinstance(obf, dict) else 0
+        ss = ev.get("strings_summary") or {}
+        decoded_cnt = int(ss.get("decoded_cnt") or 0) if isinstance(ss, dict) else 0
+        obf_strings = max(obf_count, decoded_cnt)
+
+        # YARA: имена правил одной строкой
+        yara_hits = ev.get("yara") or []
+        rule_names = " ".join(
+            str(h.get("rule") or "") for h in yara_hits if isinstance(h, dict)
+        ).lower()
+
+        is_script = sfx in ("sh", "py")
+        has_ldpreload = "ldpreload" in rule_names or "ld_preload" in rule_names
+        has_dynamic_api = (
+            "dynamic_api" in rule_names
+            or "api_resolve" in rule_names
+            or "dynamic_api_resolve" in rule_names
+        )
+        has_meterpreter = "meterpreter" in rule_names or "android_meterpreter" in rule_names
+        has_indirect_call = "indirect_call" in rule_names
+        has_warpstrings = "warpstrings" in rule_names
+
+        placed = False
+
+        # Rootkit-like: ldpreload или dynamic_api_resolve
+        if has_ldpreload or has_dynamic_api:
+            group_rootkit.append({"ev": ev, "name": name, "kind": kind, "rule_names": rule_names})
+            placed = True
+
+        # Подозрительные скрипты: .sh/.py + meterpreter или indirect_call (или WarpStrings)
+        if is_script and (has_meterpreter or has_indirect_call or has_warpstrings):
+            file_path = ev.get("path") or ev.get("file") or _get(ev, "meta.path") or name
+            group_suspicious_scripts.append({
+                "ev": ev,
+                "name": name,
+                "path": file_path,
+                "meterpreter": has_meterpreter,
+                "indirect_call": has_indirect_call,
+                "warpstrings": has_warpstrings,
+            })
+            placed = True
+
+        # Критическая обфускация: entropy > 7.2 или obf_strings > 10000
+        if entropy_val > ENTROPY_OBF_THRESHOLD or obf_strings > OBF_STRINGS_THRESHOLD:
+            weight = entropy_val * 2 + min(obf_strings / 1000.0, 50)  # для сортировки ТОП-5
+            group_obfuscated.append({"ev": ev, "name": name, "weight": weight, "entropy": entropy_val, "obf_strings": obf_strings})
+            placed = True
+
+        if not placed:
+            group_clean.append({"ev": ev, "name": name})
+
+    return {
+        "group_obfuscated": group_obfuscated,
+        "group_rootkit": group_rootkit,
+        "group_suspicious_scripts": group_suspicious_scripts,
+        "group_clean": group_clean,
+    }
+
+
+def _append_static_section_threat_groups(
+    lines: list[str], evidences: list, threat_groups: dict[str, list] | None = None
+) -> dict[str, list]:
+    """
+    Секция «Статический анализ» в виде блоков по группам угроз:
+    Критическая обфускация (ТОП-5 + и ещё N), Rootkit-like, Подозрительные скрипты (install.sh отдельно).
+    Возвращает threat_groups для использования в обосновании (при >10 файлах).
+    """
+    groups = threat_groups if threat_groups is not None else _build_threat_groups(evidences)
+    obf = groups["group_obfuscated"]
+    rootkit = groups["group_rootkit"]
+    scripts = groups["group_suspicious_scripts"]
+
+    lines.append("3) *Статический анализ*:")
+    lines.append("")
+
+    # Группа: Критическая обфускация — ТОП-5 по weight, затем «и ещё N файлов»
+    if obf:
+        sorted_obf = sorted(obf, key=lambda x: x.get("weight", 0), reverse=True)
+        top5 = sorted_obf[:5]
+        rest_count = len(sorted_obf) - 5
+        lines.append("*Группа: Критическая обфускация* (entropy > 7.2 или объём восстановленных строк > 10000):")
+        for item in top5:
+            name = item.get("name", "(файл)")
+            e = item.get("entropy", 0)
+            s = item.get("obf_strings", 0)
+            lines.append(f"  • {name} (entropy={e:.2f}, recovered_strings={s})")
+        if rest_count > 0:
+            lines.append(f"  и ещё {rest_count} файл(ов).")
+        lines.append("")
+
+    # Группа: Техники перехвата (Rootkit-like) — ELF с ld_preload, описание угрозы
+    if rootkit:
+        lines.append("*Группа: Техники перехвата (Rootkit-like)*:")
+        lines.append("  Обнаружено использование техник сокрытия кода: LD_PRELOAD и/или динамический резолв API (перехват функций ОС).")
+        lines.append("  *Пояснение:* Использование LD_PRELOAD в системных библиотеках БД является аномальным и указывает на возможность скрытого перехвата функций ОС.")
+        elf_with_ldpreload = [r for r in rootkit if (r.get("kind") or "").upper() == "ELF"]
+        for item in (elf_with_ldpreload if elf_with_ldpreload else rootkit):
+            lines.append(f"  • {item.get('name', '(файл)')}")
+        if not elf_with_ldpreload and rootkit:
+            lines.append("  (в т.ч. не-ELF файлы с признаками перехвата/скрытия API).")
+        lines.append("")
+
+    # Группа: Подозрительные скрипты — дедупликация по пути и по имени (убрать дубли install.sh)
+    if scripts:
+        seen_paths: set = set()
+        seen_names: set = set()
+        unique_scripts: list = []
+        for s in scripts:
+            path = s.get("path") or s.get("name") or ""
+            name = (s.get("name") or _basename(path) or "").lower()
+            if path and path in seen_paths:
+                continue
+            if name and name in seen_names:
+                continue
+            if path:
+                seen_paths.add(path)
+            if name:
+                seen_names.add(name)
+            unique_scripts.append(s)
+        lines.append("*Группа: Подозрительные скрипты*:")
+        install_items = [s for s in unique_scripts if (s.get("name") or "").lower() == "install.sh"]
+        others = [s for s in unique_scripts if (s.get("name") or "").lower() != "install.sh"]
+        if install_items:
+            s = install_items[0]
+            parts = []
+            if s.get("meterpreter"):
+                parts.append("android_meterpreter")
+            if s.get("warpstrings"):
+                parts.append("WarpStrings")
+            if s.get("indirect_call"):
+                parts.append("indirect_call")
+            lines.append(f"  • *install.sh* — в файле найдены: {', '.join(parts)}.")
+            if s.get("meterpreter"):
+                lines.append("    *Расшифровка:* android_meterpreter в install.sh — критический индикатор компрометации (Meterpreter payload для мобильных/встраиваемых систем, типичен для троянизированных инсталляторов).")
+        for item in others:
+            parts = []
+            if item.get("meterpreter"):
+                parts.append("meterpreter")
+            if item.get("indirect_call"):
+                parts.append("indirect_call")
+            if item.get("warpstrings"):
+                parts.append("WarpStrings")
+            lines.append(f"  • {item.get('name', '(файл)')}" + (f" ({', '.join(parts)})" if parts else ""))
+        lines.append("")
+
+    if not obf and not rootkit and not scripts:
+        lines.append("  Критических отклонений по группам угроз (обфускация, rootkit-like, подозрительные скрипты) не выявлено.")
+        lines.append("")
+
+    lines.append("")
+    return groups
+
+
+def _build_expert_justification_many_files(evidences: list, threat_groups: dict[str, list]) -> str:
+    """
+    Итоговое обоснование (Verdict) на основе агрегированных данных:
+    «Заблокировано: Системное использование техник сокрытия кода в {N} файлах. Наличие сигнатур Meterpreter в скриптах инсталляции».
+    """
+    rootkit = threat_groups.get("group_rootkit") or []
+    scripts = threat_groups.get("group_suspicious_scripts") or []
+    obf = threat_groups.get("group_obfuscated") or []
+    n_files = len(rootkit) + len(obf)
+    if n_files == 0 and scripts:
+        n_files = len(scripts)
+    parts: list[str] = []
+    if n_files > 0:
+        parts.append(f"Заблокировано: Системное использование техник сокрытия кода в {n_files} файлах.")
+    if scripts:
+        parts.append("Наличие сигнатур Meterpreter в скриптах инсталляции.")
+    if not parts:
+        return ""
+    return " ".join(parts)
+
+
 def _pe_ident_flags(ev: dict) -> tuple[list[str], bool]:
     h = _get(ev, "pe.hardening", {}) or {}
     s = _get(ev, "pe.sections", {}) or {}
@@ -1272,39 +1502,296 @@ _CWE_CRITICAL_IDS = frozenset({
     "CWE-134", "CWE-78", "CWE-89", "CWE-20", "CWE-125", "CWE-415",
 })
 
+# Маппинг CWE ID → понятное описание на русском (для таблицы «Название»)
+_CWE_ID_TO_RU: Dict[str, str] = {
+    "CWE-119": "Выход за границы буфера (Buffer Overflow)",
+    "CWE-120": "Классическое переполнение буфера (strcpy и аналоги)",
+    "CWE-134": "Небезопасное форматирование строк (Format String)",
+    "CWE-190": "Целочисленное переполнение",
+    "CWE-20": "Некорректная валидация входных данных",
+    "CWE-78": "Инъекция команд ОС (OS Command Injection)",
+    "CWE-89": "SQL-инъекция",
+    "CWE-125": "Чтение за границами буфера (Out-of-bounds Read)",
+    "CWE-415": "Double Free",
+    "CWE-416": "Use After Free",
+    "CWE-476": "Обращение к нулевому указателю (NULL Pointer Dereference)",
+    "CWE-787": "Запись за границами буфера (Out-of-bounds Write)",
+}
+
+
+def _format_cwe(cwe_id: str, raw_name: str = "") -> str:
+    """Переводит код CWE (например, CWE-190) в понятное описание на русском. Если маппинга нет — возвращает raw_name или сам ID."""
+    if not cwe_id:
+        return (raw_name or "—")[:200]
+    key = cwe_id.strip().upper()
+    if ":" in key:
+        key = key.split(":")[0].strip()
+    return _CWE_ID_TO_RU.get(key, raw_name or key)[:200]
+
 
 def _append_cwe_section(lines: list[str], evidences: list) -> None:
-    """Подраздел «Анализ бинарного кода (CWE)» в разделе 4. Критические CWE выводятся с пометкой CRITICAL."""
-    cwe_findings: list[tuple[str, bool]] = []  # (description_or_name, is_critical)
+    """Подраздел «Анализ бинарного кода (CWE)». Пустые данные — «не обнаружено»; при наличии — таблица; если аудит прошёл без багов — [X] и подтверждение."""
+    has_any_cwe = any(isinstance(e.get("cwe_analysis"), dict) for e in evidences)
+    if not has_any_cwe:
+        lines.append("— *Анализ бинарного кода (CWE)*: Специфических логических уязвимостей бинарного кода (CWE) не обнаружено.")
+        return
+    cwe_findings: list[tuple[str, str, str, bool]] = []  # (cwe_id, описание, функция, is_critical)
+    cwe_errors: list[str] = []
     for ev in evidences:
         cwe = _get(ev, "cwe_analysis") or {}
         if not isinstance(cwe, dict):
             continue
-        for f in (cwe.get("findings") or []):
+        if cwe.get("error"):
+            cwe_errors.append(cwe["error"])
+        findings = cwe.get("findings") or []
+        for f in findings:
             if not isinstance(f, dict):
                 continue
-            name = (f.get("name") or f.get("description") or f.get("cwe") or str(f))[:200]
+            raw_name = (f.get("name") or f.get("description") or f.get("cwe") or str(f))[:200]
             raw_cwe = (f.get("cwe") or f.get("id") or "").strip().upper()
-            if not raw_cwe and name:
-                m = re.search(r"CWE[-\s]?\d+", name, re.IGNORECASE)
+            if not raw_cwe and raw_name:
+                m = re.search(r"CWE[-\s]?\d+", raw_name, re.IGNORECASE)
                 if m:
                     raw_cwe = m.group(0).replace(" ", "-")
-            cwe_id = raw_cwe
-            if raw_cwe and ":" in raw_cwe:
-                cwe_id = raw_cwe.split(":")[0].strip()
+            cwe_id = raw_cwe.split(":")[0].strip() if (raw_cwe and ":" in raw_cwe) else (raw_cwe or "—")
             is_critical = (cwe_id or "") in _CWE_CRITICAL_IDS
-            display = f"{name} ({cwe_id})" if cwe_id else (name or "—")
-            if is_critical:
-                display = f"**CRITICAL** {display}"
-            cwe_findings.append((display, is_critical))
+            name_ru = _format_cwe(cwe_id, raw_name)
+            func = (f.get("function") or f.get("symbol") or f.get("location") or "").strip()[:80] or "—"
+            cwe_findings.append((cwe_id or "—", name_ru, func, is_critical))
     if not cwe_findings:
-        lines.append("— *Анализ бинарного кода (CWE)*: не выполнялся или не выявил проблем.")
+        if cwe_errors:
+            for err in cwe_errors:
+                lines.append(f"— *Анализ CWE*: ошибка запуска ({err}).")
+        else:
+            lines.append("— [X] *Аудит CWE завершён:* критических логических ошибок не выявлено.")
         return
-    lines.append("— *Анализ бинарного кода (CWE)*:")
-    for disp, _ in cwe_findings[:50]:
-        lines.append(f"  • {disp}")
+    lines.append(f"— *Binary SCA*: Найдено {len(cwe_findings)} потенциальных CWE.")
+    lines.append("")
+    lines.append("| ID | Слабость | Описание | Приоритет |")
+    lines.append("| :--- | :--- | :--- | :--- |")
+    for cwe_id, name_ru, func, is_crit in cwe_findings[:50]:
+        prio = "CRITICAL" if is_crit else "—"
+        weakness = (name_ru or "—").replace("|", ", ")
+        desc = (func or "—").replace("|", ", ")
+        lines.append(f"| {cwe_id} | {weakness} | {desc} | {prio} |")
     if len(cwe_findings) > 50:
-        lines.append(f"  … и ещё {len(cwe_findings) - 50}")
+        lines.append(f"| … | … и ещё {len(cwe_findings) - 50} | — | — |")
+    arch_risk_ids = {"CWE-415", "CWE-416", "CWE-134"}
+    arch_risks = [name_ru for (cid, name_ru, _f, _) in cwe_findings if cid in arch_risk_ids]
+    if arch_risks:
+        lines.append("")
+        lines.append("*Архитектурные риски* (CWE-checker):")
+        for ar in arch_risks[:20]:
+            lines.append(f"  • {ar.replace('|', ', ')}")
+        if len(arch_risks) > 20:
+            lines.append(f"  … и ещё {len(arch_risks) - 20}")
+
+
+def _append_scan_depth_section(lines: list[str], evidences: list) -> None:
+    """Статус-панель «Качество системы» и «Технический аудит (Этапы)» в начале раздела ПРОВЕРКА."""
+    all_yara = []
+    for e in evidences:
+        for h in (e.get("yara") or []):
+            if isinstance(h, dict) and h.get("rule"):
+                all_yara.append(str(h.get("rule")))
+    unique_rules = list(dict.fromkeys(all_yara))
+    static_ok = len(unique_rules) > 0 or any((e.get("capa") or {}).get("techniques") for e in evidences)
+    static_label = f"Выполнено ({len(unique_rules)} правил)" if unique_rules else ("Выполнено (capa)" if any((e.get("capa") or {}).get("techniques") for e in evidences) else "Не выполнялось")
+
+    cve_tot = sum(
+        int((_get(e, "cve.summary") or {}).get("critical") or 0) +
+        int((_get(e, "cve.summary") or {}).get("high") or 0) +
+        int((_get(e, "cve.summary") or {}).get("medium") or 0)
+        for e in evidences
+    )
+    cve_result = f"{cve_tot} обнаружено" if cve_tot else "0 обнаружено"
+    cve_label = f"Выполнено (Syft+Grype, {cve_result})"
+    cve_ok = True  # проверка CVE выполнялась (результат 0 или N)
+
+    # Чек-боксы синхронизированы с результатами из JSON: CWE [X] только если анализ был запущен
+    cwe_done = any(isinstance(e.get("cwe_analysis"), dict) for e in evidences)
+    cwe_count = sum(len((_get(e, "cwe_analysis") or {}).get("findings") or []) for e in evidences)
+    cwe_ok = cwe_done
+    if cwe_ok and cwe_count:
+        cwe_label = f"Выполнено (cwe_checker, {cwe_count} находок)"
+    elif cwe_ok:
+        cwe_label = "Выполнено (cwe_checker). Уязвимостей не обнаружено"
+    else:
+        cwe_label = "Не выполнялось"
+
+    # Эмуляция считается выполненной, если есть объект результата (даже с пустыми api_calls)
+    emu_ok = any(isinstance(e.get("emulation"), dict) for e in evidences)
+
+    # Статус-панель «Качество системы» (чек-боксы в начале отчёта)
+    lines.append("### Качество системы:")
+    lines.append("")
+    lines.append("  - " + ("[X]" if static_ok else "[ ]") + " **YARA:** " + ("OK" if static_ok else "—"))
+    lines.append("  - [X] **CVE:** " + ("OK" if cve_ok else "—"))
+    lines.append("  - " + ("[X]" if cwe_ok else "[ ]") + " **CWE:** " + ("OK" if cwe_ok else "—"))
+    lines.append("")
+    lines.append("### Технический аудит (Этапы):")
+    lines.append("")
+    lines.append("  - " + ("[X]" if static_ok else "[ ]") + " **Статический анализ (YARA/capa):** " + static_label)
+    lines.append("  - [X] **Поиск уязвимостей (CVE):** " + cve_label)
+    lines.append("  - " + ("[X]" if cwe_ok else "[ ]") + " **Логический аудит (CWE):** " + cwe_label)
+    lines.append("  - " + ("[X]" if emu_ok else "[ ]") + " **Эмуляция (Speakeasy):** " + ("Выполнено" if emu_ok else "Не выполнялось"))
+    lines.append("")
+
+
+def _expert_verdict_from_capa(evidences: list) -> Optional[str]:
+    """Формирует экспертный вердикт по техникам capa (MITRE ATT&CK) для уникального обоснования вместо шаблонного «Заблокировано: Сигнатуры YARA»."""
+    # Маппинг техник на короткое описание риска (для вердикта)
+    TECH_VERDICT: Dict[str, str] = {
+        "T1055": "Критический риск: Выявлена попытка манипуляции памятью сторонних процессов (техника MITRE T1055 — Process Injection), что характерно для троянов-загрузчиков.",
+        "T1055.001": "Критический риск: Инъекция кода в процесс через DLL (T1055.001). Типично для загрузчиков и RAT.",
+        "T1055.002": "Критический риск: Внедрение в процесс через исполнение в удалённом потоке (T1055.002).",
+        "T1562": "Риск: Обнаружены признаки отключения средств защиты (T1562 — Impair Defenses).",
+        "T1547": "Риск: Признаки закрепления в системе (T1547 — Boot or Logon Autostart Execution).",
+        "T1027": "Риск: Обфускация кода или данных (T1027). Повышает вероятность вредоносного payload.",
+        "T1070": "Риск: Признаки удаления следов (T1070 — Indicator Removal).",
+        "T1106": "Риск: Использование Native API (T1106) в подозрительном контексте.",
+    }
+    for ev in evidences:
+        capa = ev.get("capa") or {}
+        techniques = capa.get("techniques") or []
+        attck = capa.get("attck_by_tactic") or {}
+        for tactic, tech_list in (attck.items() if isinstance(attck, dict) else []):
+            if isinstance(tech_list, list):
+                techniques.extend(tech_list)
+        seen = set()
+        for t in techniques:
+            if not t or not isinstance(t, str):
+                continue
+            tid = (t.strip().upper().split(" ")[0])[:20]
+            if tid in seen:
+                continue
+            seen.add(tid)
+            for key, phrase in TECH_VERDICT.items():
+                if key in tid or tid.startswith(key):
+                    return phrase
+    return None
+
+
+def _append_secrets_arch_risks(lines: list[str], evidences: list) -> None:
+    """Добавляет в отчёт блок «Архитектурные риски» по результатам анализа секретов."""
+    secrets_findings: list[str] = []
+    for ev in evidences:
+        sec = ev.get("secrets") or {}
+        if not isinstance(sec, dict):
+            continue
+        if sec.get("suspicious") or sec.get("hits"):
+            for key, vals in (sec.get("hits") or {}).items():
+                if vals:
+                    secrets_findings.append(f"Секреты: {key} ({len(vals)} шт.)")
+    if secrets_findings:
+        lines.append("")
+        lines.append("*Архитектурные риски* (поиск секретов):")
+        for s in secrets_findings[:20]:
+            lines.append(f"  • {s}")
+        if len(secrets_findings) > 20:
+            lines.append(f"  … и ещё {len(secrets_findings) - 20}")
+
+
+def _append_mitre_matrix(lines: list[str], evidences: list) -> None:
+    """Таблица «Матрица техник (MITRE ATT&CK)»: находки сгруппированы по тактикам (Defense Evasion, Persistence, Discovery и др.)."""
+    by_tactic: dict[str, list[str]] = {}
+    for ev in evidences:
+        capa = _get(ev, "capa") or {}
+        attck = capa.get("attck_by_tactic") or {}
+        if not isinstance(attck, dict):
+            continue
+        for tactic, tech_list in attck.items():
+            t_key = (tactic or "").strip().lower().replace(" ", "-") or "other"
+            if t_key not in by_tactic:
+                by_tactic[t_key] = []
+            for t in (tech_list or []) if isinstance(tech_list, list) else []:
+                if t and str(t).strip() and str(t).strip() not in by_tactic[t_key]:
+                    by_tactic[t_key].append(str(t).strip())
+    if not by_tactic:
+        return
+    lines.append("")
+    lines.append("*Матрица техник (MITRE ATT&CK)*")
+    lines.append("")
+    lines.append("| Тактика | Техники / ID |")
+    lines.append("|---------|--------------|")
+    tactic_order = ["defense-evasion", "persistence", "discovery", "credential-access", "command-and-control", "execution", "impact", "collection", "exfiltration", "lateral-movement", "other"]
+    for tactic in tactic_order:
+        if tactic not in by_tactic:
+            continue
+        techs = by_tactic[tactic][:15]
+        cell = ", ".join(techs).replace("|", ", ")
+        lines.append(f"| {tactic} | {cell} |")
+    for tactic, techs in sorted(by_tactic.items()):
+        if tactic in tactic_order:
+            continue
+        cell = ", ".join((techs or [])[:15]).replace("|", ", ")
+        lines.append(f"| {tactic} | {cell} |")
+
+
+def _append_memory_dump_section(lines: list[str], evidences: list) -> None:
+    """Результаты анализа дампа памяти (Deep Memory Scan) с префиксом [MEMORY DUMP]."""
+    has_any = any((ev.get("memory_dump_analysis") or {}).get("dump_path") for ev in evidences)
+    if not has_any:
+        return
+    lines.append("")
+    lines.append("*[MEMORY DUMP] Анализ дампа памяти (второй круг)*")
+    lines.append("")
+    for ev in evidences:
+        mda = ev.get("memory_dump_analysis") or {}
+        if not mda.get("dump_path"):
+            continue
+        name = (ev.get("meta") or {}).get("path") or ev.get("path") or "?"
+        name = Path(name).name if isinstance(name, str) else str(name)
+        dump_name = Path(mda.get("dump_path", "")).name
+        lines.append(f"— *[MEMORY DUMP]* файл: {name} → дамп: {dump_name}")
+        yara_hits = mda.get("yara") or []
+        if isinstance(yara_hits, list) and yara_hits:
+            unique_rule_names = list(dict.fromkeys(
+                (h.get("rule") or h.get("name") or str(h)[:50]) for h in yara_hits if isinstance(h, dict)
+            ))
+            unique_rule_names = [r for r in unique_rule_names if r]
+            lines.append(f"  YARA: {len(unique_rule_names)} уникальных правил ({len(yara_hits)} сработок)")
+            for r in unique_rule_names[:10]:
+                lines.append(f"    • {r}")
+            if len(unique_rule_names) > 10:
+                lines.append(f"    … и ещё {len(unique_rule_names) - 10}")
+        cwe = mda.get("cwe") or {}
+        findings = cwe.get("findings") or []
+        if findings:
+            lines.append(f"  CWE: {len(findings)} находок")
+            for f in findings[:5]:
+                desc = (f.get("name") or f.get("description") or f.get("cwe") or str(f))[:80]
+                lines.append(f"    • {desc}")
+        if mda.get("scan_error"):
+            lines.append(f"  Ошибка сканирования: {mda['scan_error'][:100]}")
+        lines.append("")
+
+
+def _append_attack_storyline_section(lines: list[str], evidences: list) -> None:
+    """v3.1: граф атаки (Staged Execution) — LNK/офис → скрипт → инъекция."""
+    has_any = any(ev.get("attack_storyline") for ev in evidences)
+    if not has_any:
+        return
+    lines.append("")
+    lines.append("*[Attack Storyline] Граф атаки (Staged Execution)*")
+    lines.append("")
+    for ev in evidences:
+        graph = ev.get("attack_storyline")
+        if not graph or not graph.get("staged"):
+            continue
+        name = (ev.get("meta") or {}).get("path") or ev.get("path") or "?"
+        name = Path(name).name if isinstance(name, str) else str(name)
+        lines.append(f"— Артефакт: {name}")
+        nodes = graph.get("nodes") or []
+        edges = graph.get("edges") or []
+        for n in nodes:
+            label = n.get("label") or n.get("id") or ""
+            lines.append(f"  • {label}")
+        for e in edges:
+            fr = e.get("from") or ""
+            to = e.get("to") or ""
+            lines.append(f"  → {fr} → {to}")
+        lines.append("")
 
 
 def _append_dependency_table(lines: list[str], evidences: list) -> None:
@@ -1398,10 +1885,54 @@ def _append_dependency_table(lines: list[str], evidences: list) -> None:
     lines.append("")
 
 
+def _ident_aggregation_key(pf: dict) -> tuple:
+    """Ключ для схлопывания записей раздела 1: расширение + метаданные (например ELF с одинаковым RPATH)."""
+    ev = pf.get("ev") or {}
+    kind = (pf.get("kind") or _get(ev, "kind") or _get(ev, "type") or "BIN").upper()
+    name = pf.get("name") or _basename(_get(ev, "path") or _get(ev, "file")) or ""
+    suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if kind == "ELF":
+        h = _get(ev, "elf.hardening") or {}
+        rpath = (h.get("rpath") or "") if isinstance(h, dict) else ""
+        runpath = (h.get("runpath") or "") if isinstance(h, dict) else ""
+        if name.endswith(".so.debug") or (".so." in name and "debug" in name.lower()):
+            pattern = "lib*.so.debug"
+        elif name.endswith(".so") or ".so." in name:
+            pattern = "*.so"
+        else:
+            pattern = f"*.{suffix}" if suffix else "*"
+        return (kind, rpath, runpath, pattern)
+    if kind == "PE":
+        return (kind, suffix, _get(ev, "pe.subsystem") or "")
+    return (kind, suffix, "")
+
+
+def _group_files_by_metadata(arr: list) -> dict[tuple, list]:
+    """
+    Агрессивная группировка ELF для раздела 1: ключ (RPATH, stripped, static).
+    При идентичных метаданных выводим только общее описание и список имён.
+    """
+    by_meta: dict[tuple, list] = defaultdict(list)
+    for pf in arr:
+        ev = pf.get("ev") or {}
+        kind = (pf.get("kind") or _get(ev, "kind") or _get(ev, "type") or "BIN").upper()
+        if kind == "ELF":
+            h = _get(ev, "elf.hardening") or {}
+            rpath = (h.get("rpath") or "") if isinstance(h, dict) else ""
+            stripped = _get(ev, "elf.stripped")
+            static = _get(ev, "elf.static_linked")
+            key = ("ELF", rpath, bool(stripped), bool(static))
+        else:
+            key = _ident_aggregation_key(pf)
+        by_meta[key].append(pf)
+    return by_meta
+
+
 def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_files: bool = False, evidences: list | None = None):
-    """1) Идентификация и целостность — агрегаты по группам (+ опционально пер-файл). После Метаданные (PE) — таблица зависимостей."""
+    """1) Идентификация и целостность — агрегаты по группам; при show_files — схлопывание при count > 5 по расширению/метаданным."""
     lines.append("1) Идентификация и целостность:")
     dependency_table_appended = False
+    COLLAPSE_THRESHOLD = 5
     for gname, arr in _iter_groups(groups):
         n = len(arr)
         agg = Counter()
@@ -1424,25 +1955,63 @@ def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_fil
             parts.append(f"sig={signed}/{total_pe}")
         lines.append(f"* {gname}: {n} файл(ов)" + (", " + "; ".join(parts) if parts else ", критичных отклонений не выявлено"))
         if show_files:
-            for pf in arr:
-                ev   = pf["ev"]
-                name = pf.get("name") or _basename(_get(ev, "path") or _get(ev, "file"))
-                kind = pf.get("kind") or (_get(ev, "kind") or _get(ev, "type") or "BIN")
-                lines.append(f"— {name} [{kind}]")
-                if kind == "PE":
-                    lines.append(_pe_security_line(ev))
-                    lines.append(_pe_sections_line(ev))
-                    lines.append(_pe_signature_line(ev))
-                    lines.append(_pe_meta_line(ev))
-                    if evidences and not dependency_table_appended:
-                        _append_dependency_table(lines, evidences)
-                        dependency_table_appended = True
-                elif kind == "ELF":
-                    lines.append(_elf_details_line(ev))
-
-                eline = _errors_line(ev)
-                if eline:
-                    lines.append(eline)
+            by_meta = _group_files_by_metadata(arr)
+            # ELF: при идентичных RPATH, stripped, static — одна запись (общее описание + список имён)
+            ELF_SAME_META_MIN = 1  # схлопывать при совпадении метаданных (даже 1 файл в группе — выводим список имён)
+            seen_paths: set = set()
+            for key, sub in by_meta.items():
+                if len(key) >= 4 and key[0] == "ELF" and len(sub) > ELF_SAME_META_MIN:
+                    names = []
+                    for pf in sub:
+                        ev = pf.get("ev") or {}
+                        path = ev.get("path") or ev.get("file") or _get(ev, "meta.path") or ""
+                        if path and path in seen_paths:
+                            continue
+                        if path:
+                            seen_paths.add(path)
+                        n = pf.get("name") or _basename(_get(ev, "path") or _get(ev, "file"))
+                        if n and n not in names:
+                            names.append(n)
+                    name_list = ", ".join(names[:15])
+                    if len(names) > 15:
+                        name_list += f" и ещё {len(names) - 15}"
+                    rpath, stripped, static = key[1], key[2], key[3]
+                    params = []
+                    if rpath:
+                        params.append(f"RPATH={repr(rpath)}")
+                    params.append("stripped" if stripped else "not stripped")
+                    params.append("static" if static else "dynamic")
+                    lines.append(f"— *Группа:* {len(sub)} ELF с одинаковыми параметрами ({', '.join(params)}): {name_list}")
+                elif len(sub) > COLLAPSE_THRESHOLD and (not key or key[0] != "ELF"):
+                    kind = key[0] if key else "?"
+                    rest = list(key[1:]) if len(key) > 1 else []
+                    lines.append(f"— {len(sub)} файлов ({kind}, {rest[0] if rest else 'разные'})")
+                else:
+                    for pf in sub:
+                        ev = pf["ev"]
+                        path = ev.get("path") or ev.get("file") or _get(ev, "meta.path") or ""
+                        if path and path in seen_paths:
+                            continue
+                        if path:
+                            seen_paths.add(path)
+                        name = pf.get("name") or _basename(_get(ev, "path") or _get(ev, "file"))
+                        if not name and path:
+                            name = _basename(path)
+                        kind = pf.get("kind") or (_get(ev, "kind") or _get(ev, "type") or "BIN")
+                        lines.append(f"— {name} [{kind}]")
+                        if kind == "PE":
+                            lines.append(_pe_security_line(ev))
+                            lines.append(_pe_sections_line(ev))
+                            lines.append(_pe_signature_line(ev))
+                            lines.append(_pe_meta_line(ev))
+                            if evidences and not dependency_table_appended:
+                                _append_dependency_table(lines, evidences)
+                                dependency_table_appended = True
+                        elif kind == "ELF":
+                            lines.append(_elf_details_line(ev))
+                        eline = _errors_line(ev)
+                        if eline:
+                            lines.append(eline)
             lines.append("")
     lines.append("")
 
@@ -1607,19 +2176,27 @@ def _append_reputation_section(
             files_with_vt += 1
             any_vt = True
 
-    base = f"* Все файлы:* VT m/s/h/u = {agg['m']}/{agg['s']}/{agg['h']}/{agg['u']} ; files={files_with_vt}/{len(per_file)}"
-    if agg["bh"] > 0:
-        base += f" ; behaviours={agg['bh']}"
-    lines.append(base)
+    # Если по всем файлам в VirusTotal 0 детектирований — одна итоговая строка вместо пофайлового списка
+    all_clean = (files_with_vt > 0 and agg["m"] == 0 and agg["s"] == 0)
+    unique_hashes_n = files_with_vt
+    if all_clean:
+        lines.append("")
+        lines.append(f"Проверено {unique_hashes_n} хэша(ей), угроз не обнаружено.")
+        lines.append("")
+        show_files = False
+    else:
+        base = f"* Все файлы:* VT m/s/h/u = {agg['m']}/{agg['s']}/{agg['h']}/{agg['u']} ; files={files_with_vt}/{len(per_file)}"
+        if agg["bh"] > 0:
+            base += f" ; behaviours={agg['bh']}"
+        lines.append(base)
 
-    # --- пер-файл карточки ---
+    # --- пер-файл карточки (только для файлов с VT; строки «VT данных нет» не выводим) ---
     if show_files:
         for pf in per_file:
             ev = pf.get("ev") or {}
             name = pf.get("name") or _basename(_get(ev, "path") or _get(ev, "file"))
             vt = ev.get("vt") or {}
             if not vt:
-                lines.append(f"— {name}: VT данных нет")
                 continue
 
             st   = _st_of(vt)
@@ -1636,8 +2213,23 @@ def _append_reputation_section(
                 line += f" ; VT: {vlink}"
             lines.append(line)
 
+            # Дополнительно: множества для индикатора [VT Verified] (реестр и сеть)
+            vt_verified_reg: set = set()
+            for p in (ev.get("persistence_analysis") or {}).get("paths_found") or []:
+                if isinstance(p, dict) and p.get("verified_by_vt"):
+                    m = (p.get("match") or "").strip()
+                    if m:
+                        vt_verified_reg.add(_norm_registry_key(m))
+            vt_verified_net: set = set()
+            for i in (ev.get("network_profile") or {}).get("vt_verified_indicators") or []:
+                if isinstance(i, str) and i.strip():
+                    vt_verified_net.add(_norm_network_ioc(i))
             # детальное поведение (первая сессия + relations, если подложены в cli)
-            beh_lines = _vt_behaviour_blocks(vt, max_items=15)
+            beh_lines = _vt_behaviour_blocks(
+                vt, max_items=15,
+                vt_verified_registry=vt_verified_reg or None,
+                vt_verified_network=vt_verified_net or None,
+            )
             if not beh_lines or len(beh_lines) <= 1:
                 beh_lines = _render_vt_behaviour(vt)
             for bl in beh_lines:
@@ -1645,6 +2237,13 @@ def _append_reputation_section(
             if not beh_lines:
                 keys = list(vt.keys())[:12] if isinstance(vt, dict) else []
                 beh_lines = [f"*Behaviour:* нет детализированного вывода; vt.keys={keys}"]
+
+            # Сетевой профиль (DoH / подозрительная сеть) с индикатором [VT Verified] при совпадении с VT
+            net_prof = ev.get("network_profile") or {}
+            if isinstance(net_prof, dict) and (net_prof.get("sneaky_doh") or net_prof.get("doh_indicators")):
+                doh_str = ", ".join((net_prof.get("doh_indicators") or [])[:8])
+                vt_ver = " [VT Verified]" if net_prof.get("vt_verified") else ""
+                lines.append(f"   * Сетевой профиль:* DoH/подозрительная сеть: {doh_str or '—'}{vt_ver}")
 
             # VT Details (вкладка Details: Basic properties, Names, ELF Info)
             details = vt.get("details") if isinstance(vt, dict) else None
@@ -1706,10 +2305,12 @@ def _append_static_section(lines: list[str], *, groups: dict[str, list], show_fi
             ev = pf["ev"] or {}
             yhits = ev.get("yara") or []
             if isinstance(yhits, list) and yhits:
-                n_yara_files += 1; n_yara_rules += len(yhits)
-                for h in yhits:
-                    rn = h.get("rule") or _get(h, "meta.name")
-                    if rn: rules[str(rn)] += 1
+                unique_rules = list(dict.fromkeys(h.get("rule") or _get(h, "meta.name") for h in yhits if isinstance(h, dict)))
+                unique_rules = [r for r in unique_rules if r]
+                n_yara_files += 1
+                n_yara_rules += len(unique_rules)
+                for rn in unique_rules:
+                    rules[str(rn)] += 1
             for t in (ev.get("capa") or {}).get("techniques") or []:
                 techs[str(t)] += 1
             obf = ev.get("obfuscation") or {}
@@ -2113,13 +2714,12 @@ def _yara_line(ev: Dict[str, Any]) -> str:
     hits = ev.get("yara") or []
     if not isinstance(hits, list) or len(hits) == 0:
         return "*YARA:* сработок нет"
-    names: List[str] = []
-    for h in hits[:5]:
-        n = h.get("rule") or _get(h, "meta.name")
-        if n:
-            names.append(str(n))
-    tail = (", ".join(names)) if names else f"{len(hits)} правил"
-    more = "" if len(hits) <= 5 else f" (+{len(hits)-5})"
+    names: List[str] = list(dict.fromkeys(
+        str(h.get("rule") or _get(h, "meta.name"))
+        for h in hits if isinstance(h, dict) and (h.get("rule") or _get(h, "meta.name"))
+    ))
+    tail = (", ".join(names[:5])) if names else f"{len(hits)} правил"
+    more = "" if len(names) <= 5 else f" (+{len(names) - 5})"
     return f"*YARA:* сработки — {tail}{more}"
 
 # --- ЗАМЕНИ _floss_line НА ЭТУ ВЕРСИЮ (назадсовместимо) ---
@@ -2238,6 +2838,14 @@ def _elf_details_line(ev: Dict[str, Any]) -> str:
     if cet_sh  is True:  cet_parts.append("SHSTK")
     cet_txt = ("; CET=" + ",".join(cet_parts)) if cet_parts else ""
 
+    # Подозрительные зависимости (напр. libcurl в драйвере — сетевой доступ)
+    _SUSPICIOUS_NEEDED = {"libcurl", "libcurl.so", "libcurl.so.4", "libssl", "libcrypto", "libssh2", "libcurl.so.3"}
+    needed_lower = [str(n).lower().strip() for n in needed] if needed else []
+    suspicious = [n for n in needed_lower if any(s in n for s in _SUSPICIOUS_NEEDED)]
+    suspicious_note = ""
+    if suspicious:
+        unique_susp = list(dict.fromkeys(suspicious))
+        suspicious_note = " Подозрительные зависимости: " + ", ".join(unique_susp[:5]) + " (сетевой/крипто-доступ)."
     return (
         "ELF детали: "
         f"interp={interp or '—'}; "
@@ -2248,6 +2856,7 @@ def _elf_details_line(ev: Dict[str, Any]) -> str:
         f"RUNPATH={repr(runpath) if runpath is not None else '—'}{rp_note}; "
         f"TEXTREL={_bool(textrel)}; RWX-LOAD={_bool(wxseg)}{cet_txt}; "
         f"stripped={_bool(stripped)}; static={_bool(static)}"
+        f"{suspicious_note}"
     )
 
 def _obf_line(ev: Dict[str, Any]) -> str:
@@ -2437,6 +3046,22 @@ def _pe_meta_line(ev: Dict[str, Any]) -> str:
         parts.append("UAC(autoElevate)=True")
     return "*Метаданные (PE):* " + "; ".join(parts)
 
+def _visual_audit_line(ev: Dict[str, Any]) -> Optional[str]:
+    """Визуальный аудит (Masquerading 2.0): если иконка документа, а файл — PE, возвращает жирный алерт."""
+    vis = _get(ev, "visual") or {}
+    icon_type = (vis.get("icon_type") or vis.get("icon", {}).get("mismatch_type") or "").strip()
+    file_type = (vis.get("file_type") or _get(ev, "meta.type") or "").strip()
+    if not file_type and _kind_of(ev) == "PE":
+        file_type = "PE Executable"
+    doc_like = "document" in icon_type.lower() or "doc" in icon_type.lower() or "excel" in icon_type.lower() or "pdf" in icon_type.lower() or "word" in icon_type.lower() or "image" in icon_type.lower()
+    pe_exec = "pe executable" in file_type.lower() or file_type == "PE"
+    if doc_like and pe_exec:
+        return "**ВНИМАНИЕ: Файл мимикрирует под документ. Высокий риск социальной инженерии.**"
+    if _get(ev, "visual.masquerading_suspect") or _get(ev, "visual.icon_mismatch"):
+        return "**Внимание: возможная мимикрия под документ (несоответствие иконки и типа файла).**"
+    return None
+
+
 def _hardening_line(ev: Dict[str, Any]) -> str:
     kind = _kind_of(ev)
     if kind == "ELF":
@@ -2459,6 +3084,10 @@ def _hardening_line(ev: Dict[str, Any]) -> str:
         ov = _get(ev, "pe.sections.overlay_pct")
         if has_rwx is not None or ov is not None:
             line += f"; секции: RWX={_bool(has_rwx)}; overlay={ov if ov is not None else '—'}%"
+        dang_ord = _get(ev, "pe.dangerous_ordinal_imports") or []
+        if dang_ord:
+            apis = ", ".join(str(x.get("api") or x.get("resolved") or "?") for x in dang_ord[:5])
+            line += f". **Внимание: скрытый импорт по ординалу (опасные API): {apis}**"
         return line
     return "*Харденинг:* —"
 
@@ -2907,7 +3536,95 @@ def write_human_report(
 
     # ПРОВЕРКА
     lines.append("*ПРОВЕРКА*")
-    
+    lines.append("")
+    _append_scan_depth_section(lines, evidences)
+    threat_groups = _build_threat_groups(evidences)
+
+    # Обоснование вердикта и индикатор риска — первым под заголовком
+    try:
+        from ..scoring import compute_risk_score, build_deny_justification
+        prof = (policy.get("profile") or profile or "dev") if isinstance(policy, dict) else (profile or "dev")
+        risk_scores = [compute_risk_score(ev, profile=prof) for ev in evidences]
+        max_risk = max(risk_scores) if risk_scores else 0
+        # Визуальный индикатор уровня риска (0–100)
+        bar_len = 20
+        filled = round((max_risk / 100.0) * bar_len) if max_risk <= 100 else bar_len
+        bar = "█" * filled + "░" * (bar_len - filled)
+        risk_label = "критический" if max_risk >= 70 else ("повышенный" if max_risk >= 40 else "низкий")
+        lines.append(f"*Уровень риска:* {max_risk}/100 — {risk_label}")
+        lines.append(f"  [{bar}]")
+        pol_worst_early = "allow"
+        for ev in evidences:
+            pol = ev.get("policy") or {}
+            if (pol.get("decision") or "allow").lower() == "deny":
+                pol_worst_early = "deny"
+                # При большом числе файлов (>10) — интеллектуальное обоснование вместо «Заблокировано: Сигнатуры»
+                justification_text = pol.get("justification") or ""
+                if len(evidences) > 10:
+                    expert_just = _build_expert_justification_many_files(evidences, threat_groups)
+                    if expert_just:
+                        justification_text = expert_just
+                expert = _expert_verdict_from_capa(evidences)
+                if expert:
+                    lines.append("")
+                    lines.append("*Обоснование вердикта:* " + expert)
+                if justification_text:
+                    lines.append("")
+                    if not expert:
+                        lines.append("*Обоснование вердикта:* " + justification_text)
+                    else:
+                        lines.append("*Детали:* " + justification_text)
+                break
+        if pol_worst_early != "deny":
+            for ev in evidences:
+                pol = ev.get("policy") or {}
+                if (pol.get("decision") or "allow").lower() == "warn" and pol.get("reasons"):
+                    lines.append("")
+                    lines.append("*Замечания:* " + "; ".join((pol.get("reasons") or [])[:3]))
+                    break
+        # HVCI-совместимость и предупреждения об обходе WDAC (Enterprise Hardening)
+        for ev in evidences:
+            pe = ev.get("pe") or {}
+            if not pe:
+                continue
+            h = pe.get("hardening") or {}
+            wdac = pe.get("wdac_bypass") or {}
+            hvci = h.get("hvci_compatible")
+            if hvci is not None:
+                lines.append("")
+                lines.append("*HVCI-совместимость:* " + ("да" if hvci else "нет (требуется /INTEGRITYCHECK и отсутствие W^X)"))
+                break
+        for ev in evidences:
+            pe = ev.get("pe") or {}
+            wdac = (pe or {}).get("wdac_bypass") or {}
+            if wdac.get("suspect"):
+                lol = wdac.get("lolbins_detected") or []
+                heur = wdac.get("loader_heuristics") or []
+                parts = []
+                if lol:
+                    parts.append("LOLBins: " + ", ".join(lol[:5]))
+                if heur:
+                    parts.append("эвристики загрузчика: " + ", ".join(heur[:3]))
+                if parts:
+                    lines.append("")
+                    lines.append("*Предупреждение (обход WDAC/AppLocker):* " + "; ".join(parts))
+                break
+    except Exception:
+        pass
+    lines.append("")
+
+    # Визуальный аудит (Masquerading 2.0): иконка документа + PE Executable
+    visual_audit_lines: List[str] = []
+    for ev in evidences:
+        alert = _visual_audit_line(ev)
+        if alert:
+            name = _basename(_get(ev, "path") or _get(ev, "file")) or "(файл)"
+            visual_audit_lines.append(f"  • {name}: {alert}")
+    if visual_audit_lines:
+        lines.append("*Визуальный аудит*")
+        lines.extend(visual_audit_lines)
+        lines.append("")
+
     _append_ovf_section(lines, evidences)  # новый правильный блок (состав, сводка, строгий чек-лист, MF)
     # далее — общая идентификация групп (PE/ELF и пр.)
     _append_ident_section(lines, groups=groups, show_files=(not compact), evidences=evidences)
@@ -2922,8 +3639,8 @@ def write_human_report(
     # 2) Репутация
     _append_reputation_section(lines, per_file=per_file, groups=groups, show_files=(not compact))
 
-    # 3) Статический анализ
-    _append_static_section(lines, groups=groups, show_files=(not compact))
+    # 3) Статический анализ — по группам угроз (экспертное резюме)
+    _append_static_section_threat_groups(lines, evidences, threat_groups)
 
 
     # 4) Уязвимости зависимостей — только текст: не выявлены или список найденных CVE
@@ -2952,8 +3669,22 @@ def write_human_report(
             short = [f"{vid} ({sev})" for vid, sev in cve_ids[:30]]
             lines.append("— Найдено: " + ", ".join(short) + (" …" if len(cve_ids) > 30 else ""))
 
-    # 4) Анализ бинарного кода (CWE) — результаты cwe_checker по дампу эмуляции
+    # 4) Анализ бинарного кода (CWE) и архитектурные риски
     _append_cwe_section(lines, evidences)
+    _append_secrets_arch_risks(lines, evidences)
+    # Матрица MITRE ATT&CK по тактикам
+    _append_mitre_matrix(lines, evidences)
+    # [MEMORY DUMP] — второй круг YARA/CWE по дампу памяти
+    _append_memory_dump_section(lines, evidences)
+    # v3.1: граф атаки (Staged Execution)
+    _append_attack_storyline_section(lines, evidences)
+    # High Risk: Obfuscated при энтропии > 7.2 (DIE/LIEF) — требуется manual review
+    try:
+        from ..scoring import is_high_entropy_obfuscated
+        if any(is_high_entropy_obfuscated(ev) for ev in evidences):
+            lines.append("— *High Risk: Obfuscated* (энтропия > 7.2). Требуется ручная проверка (manual review).")
+    except Exception:
+        pass
 
     lines.append("")
 
@@ -2966,6 +3697,24 @@ def write_human_report(
     pol_worst, _, _, _ = _worst_decision([pf["ev"] for pf in per_file])
     if pol_worst == "deny":
         lines.append("Файлы отклонены к использованию.")
+        # Автообоснование DENY: при >10 файлах — экспертное резюме по группам угроз
+        if len(evidences) > 10:
+            expert_just = _build_expert_justification_many_files(evidences, threat_groups)
+            if expert_just:
+                lines.append(expert_just)
+            else:
+                for pf in per_file:
+                    pol = (pf.get("ev") or {}).get("policy") or {}
+                    if pol.get("decision") == "deny" and pol.get("justification"):
+                        lines.append(pol["justification"])
+                        break
+        else:
+            for pf in per_file:
+                ev = pf.get("ev") or {}
+                pol = ev.get("policy") or {}
+                if pol.get("decision") == "deny" and pol.get("justification"):
+                    lines.append(pol["justification"])
+                    break
         # Если DENY связан с VMProtect и скрытыми библиотеками из эмуляции — указать в обосновании
         has_vmprotect = False
         has_emulation_libs = False

@@ -45,6 +45,11 @@ class Evidence:
     # --- Enterprise Hardening (v0.0.7+) ---
     # PE overlay analysis
     overlay: Optional[Dict[str, Any]] = None
+
+    # v2.0 Elite: стеганография (T1027.003) — LSB высокая энтропия в иконках/BMP
+    steganography: Optional[Dict[str, Any]] = None
+    # v2.0 Elite: бинарный padding (T1027.001) — гигантский файл, ленивый анализ
+    binary_padding: Optional[Dict[str, Any]] = None
     
     # .NET assembly intelligence
     dotnet: Optional[Dict[str, Any]] = None
@@ -126,6 +131,10 @@ class Evidence:
             "risk_score": 0,
         }
     )
+
+    # Persistence (автозагрузка) и сетевой профиль (DoH) — для кросс-верификации с VT behaviour
+    persistence_analysis: Optional[Dict[str, Any]] = None
+    network_profile: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

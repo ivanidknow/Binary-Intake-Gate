@@ -14,7 +14,7 @@ private rule __is_text    { condition: filesize > 200 and filesize < 5MB and !__
 
 rule PE_CredDump_LSASS_MiniDump_APIs
 {
-  meta: category="cred-dump" severity="critical" rationale="MiniDumpWriteDump + lsass + SeDebugPrivilege"
+  meta: category="cred-dump" technique="T1003.001" severity="critical" rationale="MiniDumpWriteDump + lsass + SeDebugPrivilege"
   strings:
     $mdw  = "MiniDumpWriteDump" ascii
     $dbg  = "SeDebugPrivilege" ascii
@@ -50,12 +50,36 @@ rule PE_CredDump_ProcDump_LSASS
 
 rule Win_RegSave_SAM_System_Security
 {
-  meta: category="cred-dump" severity="high" rationale="reg save HKLM\\SAM/SYSTEM/SECURITY"
+  meta: category="cred-dump" technique="T1003.002" severity="high" rationale="reg save HKLM\\SAM/SYSTEM/SECURITY"
   strings:
     $rg = /reg(\.exe)?\s+save\s+HKLM\\(SAM|SYSTEM|SECURITY)\s+[A-Za-z0-9_:\\\.]+/i ascii
     $rv = /reg(\.exe)?\s+save\s+HKEY_LOCAL_MACHINE\\(SAM|SYSTEM|SECURITY)/i ascii
   condition:
     __is_text and ( $rg or $rv )
+}
+
+/* ================= 2b) Defense Evasion: Firewall disable / IFEO ================= */
+
+rule PE_Defense_Disable_Firewall
+{
+  meta: category="defense-evasion" technique="T1562" severity="high" rationale="netsh advfirewall / INetFwPolicy2"
+  strings:
+    $f1 = /advfirewall\s+set\s+allprofiles\s+state\s+off/i ascii
+    $f2 = "INetFwPolicy2" ascii
+    $f3 = "netsh advfirewall" ascii nocase
+  condition:
+    (__is_pe and __smallish and ($f1 or $f2 or $f3)) or (__is_text and ($f1 or $f2 or $f3))
+}
+
+rule PE_IFEO_Injection
+{
+  meta: category="persistence" technique="T1546.012" severity="high" rationale="Image File Execution Options + Debugger"
+  strings:
+    $i1 = "Image File Execution Options" ascii nocase
+    $i2 = "Debugger" ascii
+    $i3 = /Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options/i ascii
+  condition:
+    (__is_pe and __smallish and $i1 and $i2) or (__is_text and $i1 and $i2) or (__is_pe and $i3 and $i2)
 }
 
 /* ================= 3) Mimikatz-like артефакты ================= */
@@ -122,9 +146,21 @@ rule Win_Lateral_WinRM_PowerShell_Remoting
     __is_text and ( $r1 or $r2 or $r3 )
 }
 
+rule PE_Lateral_Tool_Transfer_Strings
+{
+  meta: category="lateral" technique="T1570" severity="high" rationale="CopyFileEx + UNC C$/ADMIN$"
+  strings:
+    $c1 = "CopyFileEx" ascii
+    $c2 = "NetUseAdd" ascii
+    $u1 = /\\\\[^\x00]+\\C\$/ ascii
+    $u2 = /\\\\[^\x00]+\\ADMIN\$/ ascii
+  condition:
+    __is_pe and $c1 and ($u1 or $u2 or $c2)
+}
+
 rule Win_Lateral_SMB_Copy_And_Exec
 {
-  meta: category="lateral" severity="medium" rationale="copy через ADMIN$ + ат/schtasks выполнение"
+  meta: category="lateral" technique="T1570" severity="medium" rationale="copy через ADMIN$ + ат/schtasks выполнение"
   strings:
     $c1 = /copy\s+[A-Za-z0-9_:\\\.]+\\\S+\s+\\\\[^\s]+\\ADMIN\$/i ascii
     $a1 = /AT\s+\\\\[^\s]+\s+\d{1,2}:\d{2}\s+\/interactive\s+/i ascii

@@ -100,6 +100,7 @@ def _parse_lnk_file(data: bytes) -> Dict[str, Any]:
         "payloads": [],
         "decoded_payloads": [],
         "suspicious_patterns": [],
+        "technique_hints": [],
     }
     
     # Check magic
@@ -224,6 +225,11 @@ def _parse_lnk_file(data: bytes) -> Dict[str, Any]:
         for pattern, stager_type in STAGER_PATTERNS:
             if re.search(pattern, cmd_lower, re.IGNORECASE):
                 result["suspicious_patterns"].append(stager_type)
+        # T1204.001 Malicious Link: URL leading to .zip or .iso download
+        url_zip_iso = re.search(r'https?://[^\s\'"]+\.(zip|iso)(?:\s|$|[\'"])', cmd_lower)
+        if url_zip_iso:
+            result["suspicious_patterns"].append("malicious_link_download")
+            result["technique_hints"].append("T1204.001")
     
     return result
 
@@ -447,12 +453,17 @@ def analyze(path: Path, max_bytes: int = 5*1024*1024) -> dict:
         return res
     
     if res["type"] == "lnk":
+        lnk_parsed = _parse_lnk_file(data)
+        res["lnk"] = lnk_parsed
+        res["technique_hints"] = list(lnk_parsed.get("technique_hints") or [])
         payload_hits = sum(
             1 for k in (b"cmd.exe /c", b"powershell", b"mshta", b"wscript.exe", b"cscript.exe", b"rundll32")
             if k in data.lower()
         )
+        if lnk_parsed.get("suspicious_patterns"):
+            payload_hits += len(lnk_parsed["suspicious_patterns"])
         res["triggers"] = [f"payload_hits={payload_hits}"]
-        res["suspicious"] = payload_hits > 0
+        res["suspicious"] = payload_hits > 0 or bool(res["technique_hints"])
         res["score"] = mult * payload_hits
     else:
         for t in src:

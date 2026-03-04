@@ -378,11 +378,13 @@ def _host_path_for_docker_mount(path: Path) -> str:
 def run_emulation_container(
     host_file_path: Path,
     timeout: int = 60,
+    max_api_calls: Optional[int] = None,
 ) -> Tuple[int, str, str, Optional[Dict[str, Any]]]:
     """
     Run Speakeasy emulation in Docker. Mounts host_file_path parent as /input and a temp dir as /output.
     Container outputs structured JSON between !!!JSON_REPORT_START!!! and !!!JSON_REPORT_END!!! (no Base64).
     !!!MODULE_LOADED:<name> lines are parsed into report_dict["modules"]. Returns (return_code, stdout, stderr, report_dict).
+    max_api_calls: при VMProtect передать 5000 (контейнер читает MAX_API_CALLS).
     """
     import tempfile
     import json as _json
@@ -409,6 +411,9 @@ def run_emulation_container(
             "-e", f"WRITE_REPORT={report_path_container}",
             EMULATION_IMAGE,
         ]
+        if max_api_calls is not None:
+            cmd.insert(-1, "-e")
+            cmd.insert(-1, f"MAX_API_CALLS={max_api_calls}")
         try:
             result = subprocess.run(
                 cmd,
@@ -524,54 +529,44 @@ def run_emulation_container(
 def run_cwe_checker(file_path: Path) -> Dict[str, Any]:
     """
     Run cwe_checker (fkiecad/cwe_checker) in Docker on the given binary/dump file.
-    Command: cwe_checker /target/file --json.
-    Returns dict with keys: findings (list), error (str or None), return_code (int).
+    Mounts parent folder as /share:ro; command: cwe_checker /share/<name> --json.
+    Returns dict with keys: findings (list), error (str or None), return_code (int), stderr (str).
     """
     import json as _json
     host_path = Path(file_path)
     if not host_path.exists():
-        return {"findings": [], "error": "file_not_found", "return_code": -1}
-    mount_src = _host_path_for_docker_mount(host_path.parent)
-    container_path = f"/target/{host_path.name}"
-    mount = f"{mount_src}:/target:ro"
-    cmd = [
-        "docker", "run", "--rm", "--network", "none",
-        "-v", mount,
-        CWE_CHECKER_IMAGE,
-        container_path, "--json",
-    ]
-    timeout = 300
+        return {"findings": [], "error": "file_not_found", "return_code": -1, "stderr": ""}
+    host_dir = host_path.parent.resolve()
+    container_file = f"/share/{file_path.name}"
+    cmd = ["docker", "run", "--rm", "-v", f"{host_dir}:/share:ro", CWE_CHECKER_IMAGE, container_file, "--json"]
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
-        return {"findings": [], "error": f"timeout_{timeout}s", "return_code": -1}
+        return {"findings": [], "error": "timeout_300s", "return_code": -1, "stderr": ""}
     except Exception as e:
-        return {"findings": [], "error": str(e), "return_code": -1}
+        return {"findings": [], "error": str(e), "return_code": -1, "stderr": ""}
+    if result.returncode != 0:
+        print(f"[DOCKER_ERROR] cwe_checker failed: {result.stderr}", flush=True)
+    import re as _re
     stdout_str = (result.stdout or "").strip()
     stderr_str = (result.stderr or "").strip()
+    print(f"[DOCKER_CWE] Raw stdout length: {len(stdout_str)}", flush=True)
     findings: List[Dict[str, Any]] = []
-    if stdout_str:
+    match = _re.search(r"\[\s*\{.*\}\s*\]", result.stdout or "", _re.DOTALL)
+    if match:
         try:
-            data = _json.loads(stdout_str)
+            data = _json.loads(match.group(0))
             if isinstance(data, list):
                 findings = data
-            elif isinstance(data, dict):
-                findings = data.get("results", data.get("findings", data.get("data", [])))
-                if not isinstance(findings, list):
-                    findings = [data] if data else []
-            else:
-                findings = []
         except Exception:
             pass
-    out = {"findings": findings, "error": None if result.returncode == 0 else (stderr_str[:500] or f"exit_{result.returncode}"), "return_code": result.returncode}
-    if stderr_str and result.returncode != 0 and not out["error"]:
-        out["error"] = stderr_str[:500]
-    return out
+    error = None if result.returncode == 0 else (stderr_str[:500] if stderr_str else f"exit_{result.returncode}")
+    return {
+        "findings": findings,
+        "error": error,
+        "return_code": result.returncode,
+        "stderr": stderr_str,
+    }
 
 
 # Startup validation
@@ -591,10 +586,21 @@ def validate_docker_at_startup() -> DockerStatus:
         return _docker_status
     
     _docker_status = ensure_docker_or_fail()
-    
+
     # Create cache volumes
     ensure_cache_volumes()
-    
+
+    # Force pull CWE checker image and fail if unavailable
+    ok, err = pull_image(CWE_CHECKER_IMAGE, timeout=300)
+    if not ok:
+        raise DockerImageNotFoundError(
+            f"Failed to pull {CWE_CHECKER_IMAGE}. {err or 'Unknown error'}. CWE analysis will be unavailable."
+        )
+    if not image_exists(CWE_CHECKER_IMAGE):
+        raise DockerImageNotFoundError(
+            f"Image {CWE_CHECKER_IMAGE} is not present after pull. CWE analysis will be unavailable."
+        )
+
     _docker_validated = True
     return _docker_status
 

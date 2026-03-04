@@ -49,6 +49,19 @@ rule GO_Loader_HTTP_Base64_Exec
     __smallish and GO_Runtime_Fingerprint and ( ( $h1 or $h2 ) and ( $j1 or $b6 ) and ( $ex or $sh ) )
 }
 
+/* A2b: Go Garble (v2.0): Go runtime present but type/function names stripped — эвристика по отсутствию main.main / runtime.main */
+rule GO_Garble_Heuristic
+{
+  meta: category="go-garble" severity="medium" mitre="T1027"
+  strings:
+    $g0 = ".gopclntab" ascii
+    $g1 = "go build id" ascii nocase
+    $m  = "main.main" ascii
+    $r  = "runtime.main" ascii
+  condition:
+    __smallish and ( $g0 or $g1 ) and not ( $m or $r )
+}
+
 /* A3: Go syscall/injection-ish примитивы */
 rule GO_Syscall_And_Process_Primitives
 {

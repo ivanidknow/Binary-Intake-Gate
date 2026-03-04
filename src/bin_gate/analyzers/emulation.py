@@ -19,6 +19,7 @@ import json
 import tempfile
 import hashlib
 import threading
+import time
 
 _emu_log_lock = threading.Lock()
 _last_dump_reason: str = ""
@@ -65,6 +66,9 @@ def _emu_log(msg: str) -> None:
 EMULATION_TIMEOUT_SEC = int(os.getenv("BIN_GATE_EMULATION_TIMEOUT", "60"))
 EMULATION_MAX_INSTRUCTIONS = int(os.getenv("BIN_GATE_EMULATION_MAX_INSTR", "10000000"))
 EMULATION_MAX_FILE_SIZE_MB = int(os.getenv("BIN_GATE_EMULATION_MAX_MB", "50"))
+# v3.1: лимит одновременных контейнеров эмуляции (должны быть до _emulation_slot_acquire)
+EMULATION_MAX_CONCURRENT = int(os.getenv("BIN_GATE_EMULATION_MAX_CONCURRENT", "2"))
+EMULATION_SLOT_WAIT_TIMEOUT = int(os.getenv("BIN_GATE_EMULATION_SLOT_TIMEOUT", "300"))
 
 
 @dataclass
@@ -150,7 +154,15 @@ SUSPICIOUS_APIS = {
         "GetComputerName", "GetUserName", "GetSystemInfo",
         "GetVersionEx", "GetLocaleInfo", "GetKeyboardLayout",
         "EnumProcesses", "CreateToolhelp32Snapshot",
+        "Process32First", "Process32Next",
+        "FindFirstFileA", "FindFirstFileW", "FindNextFileA", "FindNextFileW",
     ],
+    "peripheral_discovery": ["SetupDiGetClassDevsA", "SetupDiGetClassDevsW", "SetupDiEnumDeviceInfo"],
+    "registry_query": ["RegOpenKeyExA", "RegOpenKeyExW", "RegQueryValueExA", "RegQueryValueExW", "RegEnumKeyExA"],
+    "screen_capture": ["BitBlt", "GetDC", "CreateCompatibleDC", "GetDesktopWindow"],
+    "native_api": ["NtCreateSection", "NtMapViewOfSection", "ZwQuerySystemInformation", "LdrLoadDll"],
+    "network_config": ["GetAdaptersInfo", "GetAdaptersAddresses"],
+    "network_connections": ["GetTcpTable", "GetExtendedTcpTable"],
     "network": [
         "InternetOpen", "InternetConnect", "HttpOpenRequest",
         "HttpSendRequest", "URLDownloadToFile", "WinHttpOpen",
@@ -176,6 +188,8 @@ API_TO_TECHNIQUE = {
     "SetThreadContext": ["T1055.012", "process-hollowing"],
     "RegSetValueEx": ["T1547.001", "persistence"],
     "CreateService": ["T1543.003", "persistence"],
+    "CreateServiceA": ["T1543.003", "persistence"],
+    "CreateServiceW": ["T1543.003", "persistence"],
     "IsDebuggerPresent": ["T1497.001", "defense-evasion"],
     "CheckRemoteDebuggerPresent": ["T1497.001", "defense-evasion"],
     "GetTickCount": ["T1497.003", "defense-evasion"],
@@ -183,6 +197,99 @@ API_TO_TECHNIQUE = {
     "URLDownloadToFile": ["T1105", "ingress-tool-transfer"],
     "CryptEncrypt": ["T1027", "defense-evasion"],
     "CryptDecrypt": ["T1140", "deobfuscation"],
+    # 10 new APT-style techniques
+    "SetupDiGetClassDevsA": ["T1120", "peripheral-device-discovery"],
+    "SetupDiGetClassDevsW": ["T1120", "peripheral-device-discovery"],
+    "SetupDiEnumDeviceInfo": ["T1120", "peripheral-device-discovery"],
+    "RegOpenKeyExA": ["T1012", "query-registry"],
+    "RegOpenKeyExW": ["T1012", "query-registry"],
+    "RegQueryValueExA": ["T1012", "query-registry"],
+    "RegQueryValueExW": ["T1012", "query-registry"],
+    "RegEnumKeyExA": ["T1012", "query-registry"],
+    "FindFirstFileA": ["T1083", "file-directory-discovery"],
+    "FindFirstFileW": ["T1083", "file-directory-discovery"],
+    "FindNextFileA": ["T1083", "file-directory-discovery"],
+    "FindNextFileW": ["T1083", "file-directory-discovery"],
+    "BitBlt": ["T1113", "screen-capture"],
+    "GetDC": ["T1113", "screen-capture"],
+    "CreateCompatibleDC": ["T1113", "screen-capture"],
+    "GetDesktopWindow": ["T1113", "screen-capture"],
+    "CreateToolhelp32Snapshot": ["T1057", "process-discovery"],
+    "Process32First": ["T1057", "process-discovery"],
+    "Process32Next": ["T1057", "process-discovery"],
+    "NtCreateSection": ["T1106", "native-api"],
+    "NtMapViewOfSection": ["T1106", "native-api"],
+    "ZwQuerySystemInformation": ["T1106", "native-api"],
+    "LdrLoadDll": ["T1106", "native-api"],
+    "GetAdaptersInfo": ["T1016", "network-config-discovery"],
+    "GetAdaptersAddresses": ["T1016", "network-config-discovery"],
+    "GetTcpTable": ["T1049", "network-connections-discovery"],
+    "GetExtendedTcpTable": ["T1049", "network-connections-discovery"],
+    "OpenSCManagerA": ["T1543.003", "persistence"],
+    "OpenSCManagerW": ["T1543.003", "persistence"],
+    "ChangeServiceConfigA": ["T1543.003", "persistence"],
+    "ChangeServiceConfigW": ["T1543.003", "persistence"],
+    "RtlDecompressBuffer": ["T1140", "deobfuscation"],
+    # 10 techniques: UAC Bypass, Modify Registry, File Deletion, etc.
+    "DeleteFileA": ["T1070.004", "file-deletion"],
+    "DeleteFileW": ["T1070.004", "file-deletion"],
+    "MoveFileExA": ["T1070.004", "file-deletion"],
+    "MoveFileExW": ["T1070.004", "file-deletion"],
+    "GetSystemTime": ["T1124", "system-time-discovery"],
+    "GetTickCount": ["T1124", "system-time-discovery"],
+    "GetTickCount64": ["T1124", "system-time-discovery"],
+    "GetSystemTimeAsFileTime": ["T1124", "system-time-discovery"],
+    "GetComputerNameA": ["T1082", "system-info-discovery"],
+    "GetComputerNameW": ["T1082", "system-info-discovery"],
+    "GetVersionExA": ["T1082", "system-info-discovery"],
+    "GetVersionExW": ["T1082", "system-info-discovery"],
+    "GetUserNameA": ["T1082", "system-info-discovery"],
+    "GetUserNameW": ["T1082", "system-info-discovery"],
+    "InternetSetOptionA": ["T1090", "proxy"],
+    "InternetSetOptionW": ["T1090", "proxy"],
+    # Impair Defenses, Event Log Clear, IFEO, Hidden, Root Cert, Phishing
+    "ClearEventLogA": ["T1070.001", "indicator-removal"],
+    "ClearEventLogW": ["T1070.001", "indicator-removal"],
+    "TerminateProcess": ["T1562.001", "impair-defenses"],
+    "SetFileAttributesA": ["T1564.001", "hidden-files"],
+    "SetFileAttributesW": ["T1564.001", "hidden-files"],
+    "ShowWindow": ["T1564.003", "hidden-window"],
+    "CertAddCertificateContextToStore": ["T1553.004", "subvert-trust"],
+    "CreateWindowExA": ["T1056.002", "input-capture"],
+    "GetWindowTextW": ["T1056.002", "input-capture"],
+    # v0.1.6 Lateral Movement & Network Discovery (NetAPI32, iphlpapi, etc.)
+    "NetServerEnum": ["T1018", "remote-system-discovery"],
+    "NetServerEnumEx": ["T1018", "remote-system-discovery"],
+    "GetIpNetTable": ["T1018", "remote-system-discovery"],
+    "NetUserEnum": ["T1087.001", "account-discovery"],
+    "NetGetDisplayInformationIndex": ["T1087.002", "domain-account-discovery"],
+    "NetLocalGroupEnum": ["T1069.001", "permission-groups-discovery"],
+    "NetUseAdd": ["T1021.002", "remote-services-smb"],
+    "CopyFileExW": ["T1570", "lateral-tool-transfer"],
+    "CopyFileExA": ["T1570", "lateral-tool-transfer"],
+    "BluetoothFindFirstDevice": ["T1011.001", "exfiltration-bluetooth"],
+    "BluetoothFindNextDevice": ["T1011.001", "exfiltration-bluetooth"],
+    # Top-20 sub-techniques: injection variants, timestomp, WMI, LOLBins
+    "LoadLibraryA": ["T1055.002", "dll-injection"],
+    "LoadLibraryW": ["T1055.002", "dll-injection"],
+    "SuspendThread": ["T1055.003", "thread-hijacking"],
+    "GetThreadContext": ["T1055.003", "thread-hijacking"],
+    "SetFileTime": ["T1070.006", "timestomp"],
+    "GetFileTime": ["T1070.006", "timestomp"],
+    "IWbemServices_PutInstance": ["T1546.003", "wmi-subscription"],
+    "IWbemClassObject": ["T1546.003", "wmi-subscription"],
+    "GetIpForwardTable": ["T1016.001", "network-config-discovery"],
+    "NetGroupEnum": ["T1069.002", "domain-groups-discovery"],
+    # Deep Coverage: APC, TLS, EWMI, Event Logging, DCOM
+    "QueueUserAPC": ["T1055.004", "process-injection"],
+    "NtQueueApcThread": ["T1055.004", "process-injection"],
+    "TlsAlloc": ["T1055.005", "process-injection"],
+    "TlsSetValue": ["T1055.005", "process-injection"],
+    "SetWindowLongPtrA": ["T1055.011", "process-injection"],
+    "SetWindowLongPtrW": ["T1055.011", "process-injection"],
+    "EtwEventWrite": ["T1562.002", "impair-defenses"],
+    "CoInitializeEx": ["T1021.003", "lateral-movement"],
+    "CoCreateInstanceEx": ["T1021.003", "lateral-movement"],
 }
 
 
@@ -195,8 +302,83 @@ def _check_file_size(path: Path) -> bool:
         return False
 
 
+def _detect_sequential_techniques(api_calls: List[Dict[str, Any]]) -> List[str]:
+    """
+    Маппинг последовательных вызовов API в сложные техники.
+    Например: VirtualAllocEx + WriteProcessMemory + (CreateRemoteThread или SetThreadContext+ResumeThread)
+    → T1055 (Process Injection) / T1055.012 (Process Hollowing).
+    """
+    added: Set[str] = set()
+    names = [c.get("api", "") for c in api_calls if isinstance(c, dict)]
+    if not names:
+        return []
+    # Alloc + Write + Execute → Process Injection
+    alloc = any("VirtualAlloc" in n or "NtAllocateVirtualMemory" in n for n in names)
+    write = any("WriteProcessMemory" in n or "NtWriteVirtualMemory" in n for n in names)
+    remote_thread = any("CreateRemoteThread" in n or "NtCreateThreadEx" in n or "RtlCreateUserThread" in n for n in names)
+    set_ctx = any("SetThreadContext" in n or "NtSetContextThread" in n for n in names)
+    resume = any("ResumeThread" in n for n in names)
+    hollow = any("NtUnmapViewOfSection" in n or "ZwUnmapViewOfSection" in n for n in names)
+    if alloc and write and (remote_thread or (set_ctx and resume)):
+        added.add("T1055")
+        added.add("process-injection")
+    if hollow and (set_ctx or "SetThreadContext" in names) and (resume or "ResumeThread" in names):
+        added.add("T1055.012")
+        added.add("process-hollowing")
+    load_lib = any("LoadLibrary" in n for n in names)
+    if remote_thread and load_lib:
+        added.add("T1055.002")
+        added.add("dll-injection")
+    if any("SuspendThread" in n for n in names) and set_ctx and not hollow:
+        added.add("T1055.003")
+        added.add("thread-hijacking")
+    # APC injection: QueueUserAPC / NtQueueApcThread + alloc
+    apc = any("QueueUserAPC" in n or "NtQueueApcThread" in n for n in names)
+    if apc and alloc:
+        added.add("T1055.004")
+        added.add("process-injection")
+    # TLS injection
+    if any("TlsAlloc" in n or "TlsSetValue" in n for n in names):
+        added.add("T1055.005")
+    # EWMI: SetWindowLongPtr
+    if any("SetWindowLongPtr" in n for n in names):
+        added.add("T1055.011")
+    # Disable Event Logging (EtwEventWrite patch)
+    if any("EtwEventWrite" in n for n in names):
+        added.add("T1562.002")
+    # DCOM lateral
+    if any("CoInitializeEx" in n or "CoCreateInstanceEx" in n for n in names):
+        added.add("T1021.003")
+    if any("SetFileTime" in n for n in names):
+        added.add("T1070.006")
+        added.add("timestomp")
+    # Self-Deletion: DeleteFile or MoveFileEx (T1070.004)
+    if any("DeleteFile" in n or "MoveFileEx" in n for n in names):
+        added.add("T1070.004")
+        added.add("file-deletion")
+    # UAC Bypass pattern: RegSetValueEx + registry key creation (T1548.002)
+    reg_set = any("RegSetValueEx" in n or "RegSetValueExA" in n or "RegSetValueExW" in n for n in names)
+    reg_create = any("RegCreateKeyEx" in n or "RegOpenKeyEx" in n for n in names)
+    if reg_set and reg_create:
+        added.add("T1548.002")
+        added.add("uac-bypass")
+    # Hidden window: CreateProcess often used with CREATE_NO_WINDOW (0x08000000) or SW_HIDE
+    create_proc = any("CreateProcess" in n for n in names)
+    if create_proc and any("CreateProcess" in n for n in names):
+        for c in api_calls:
+            if not isinstance(c, dict):
+                continue
+            args = c.get("args") or []
+            args_str = " ".join(str(a) for a in args).lower()
+            if "0x08000000" in args_str or "create_no_window" in args_str or "sw_hide" in args_str:
+                added.add("T1564.003")
+                added.add("hidden-window")
+                break
+    return sorted(added)
+
+
 def _extract_techniques(api_calls: List[Dict[str, Any]]) -> List[str]:
-    """Extract ATT&CK techniques from API calls."""
+    """Extract ATT&CK techniques from API calls (single-call + sequential chains)."""
     techniques: Set[str] = set()
     
     for call in api_calls:
@@ -208,6 +390,9 @@ def _extract_techniques(api_calls: List[Dict[str, Any]]) -> List[str]:
         for category, apis in SUSPICIOUS_APIS.items():
             if api_name in apis:
                 techniques.add(category)
+    
+    # Sequential chain: Alloc + Write + Execute → T1055 / Process Hollowing
+    techniques.update(_detect_sequential_techniques(api_calls))
     
     return sorted(techniques)
 
@@ -551,9 +736,37 @@ def _run_unicorn_shellcode_emulation(data: bytes, arch: str = "x86") -> Emulatio
     return result
 
 
-def _run_speakeasy_emulation_via_docker(path: Path, timeout: int) -> EmulationResult:
+def _emulation_slot_acquire(timeout_sec: int = EMULATION_SLOT_WAIT_TIMEOUT):
+    """v3.1: захват слота для ограничения одновременных контейнеров эмуляции. Возвращает путь к файлу слота или None."""
+    slot_dir = Path(tempfile.gettempdir()) / "bin_gate_emulation_slots"
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for i in range(EMULATION_MAX_CONCURRENT):
+            slot_path = slot_dir / f"slot_{i}"
+            try:
+                fd = os.open(str(slot_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
+                return slot_path
+            except FileExistsError:
+                continue
+        time.sleep(1.0)
+    return None
+
+
+def _emulation_slot_release(slot_path) -> None:
+    """v3.1: освобождение слота."""
+    if slot_path:
+        try:
+            Path(slot_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _run_speakeasy_emulation_via_docker(path: Path, timeout: int, max_api_calls: int = 1000) -> EmulationResult:
     """
     Run Speakeasy emulation inside Docker (Linux image; use when local import fails e.g. on Windows).
+    v3.1: лимит одновременных контейнеров через слоты (EMULATION_MAX_CONCURRENT).
     Returns EmulationResult with memory_dump_path set if dump was produced.
     """
     result = EmulationResult()
@@ -580,14 +793,47 @@ def _run_speakeasy_emulation_via_docker(path: Path, timeout: int) -> EmulationRe
             result.error = f"emulation_image_build_failed: {err}"
             return result
 
-    rc, stdout, stderr, report_dict = run_emulation_container(path, timeout=timeout)
+    slot = _emulation_slot_acquire()
+    if slot is None:
+        result.error = "emulation_slot_timeout"
+        return result
+    try:
+        rc, stdout, stderr, report_dict = run_emulation_container(path, timeout=timeout, max_api_calls=max_api_calls)
+    finally:
+        _emulation_slot_release(slot)
+    result.docker_stdout_length = len(stdout)
+
+    # Parse Base64 dump even on non-zero exit (container may dump memory on run_module failure)
+    import base64
+    start_m = "DUMP_BASE64_START"
+    end_m = "DUMP_BASE64_END"
+    if start_m in stdout and end_m in stdout:
+        try:
+            i = stdout.index(start_m) + len(start_m)
+            j = stdout.index(end_m)
+            b64 = stdout[i:j].strip().replace("\n", "").replace("\r", "")
+            dump_bytes = base64.b64decode(b64)
+            if dump_bytes:
+                fd, stable_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
+                try:
+                    os.write(fd, dump_bytes)
+                    result.memory_dump_path = stable_path
+                    result.success = True
+                    _emu_log(f"emulation docker: dump {len(dump_bytes)} bytes -> {stable_path}")
+                finally:
+                    os.close(fd)
+        except Exception as e:
+            if not result.memory_dump_path:
+                result.dump_failure_reason = f"emulation_docker_decode: {e}"
+
     if rc != 0:
         result.error = f"emulation_docker_exit_{rc}"
         if stderr:
             result.error += f": {stderr[:200].strip()}"
-        return result
+        # If we got a dump despite exit != 0, caller can still use memory_dump_path
+        if not result.memory_dump_path:
+            return result
 
-    result.docker_stdout_length = len(stdout)
     _emu_log(f"Docker RAW output length: {result.docker_stdout_length}. Looking for modules...")
 
     # Parse JSON report from container (docker_utils uses r"!!!MODULE_LOADED!!!:.*?([\w\-. ]+\.dll)" for DLLs with weird separators): fill api_summary, decoded_strings, modules
@@ -603,27 +849,7 @@ def _run_speakeasy_emulation_via_docker(path: Path, timeout: int) -> EmulationRe
         n_apis = len(result.api_summary) if isinstance(result.api_summary, dict) else 0
         _emu_log(f"Docker report parsed: found {n_strings} strings and {n_apis} API calls.")
 
-    # Optional: parse Base64 dump if present (DUMP_BASE64_START/END). If no dump, success = having report/modules.
-    import base64
-    start_m = "DUMP_BASE64_START"
-    end_m = "DUMP_BASE64_END"
-    if start_m in stdout and end_m in stdout:
-        try:
-            i = stdout.index(start_m) + len(start_m)
-            j = stdout.index(end_m)
-            b64 = stdout[i:j].strip().replace("\n", "").replace("\r", "")
-            dump_bytes = base64.b64decode(b64)
-            if dump_bytes:
-                fd, stable_path = tempfile.mkstemp(suffix=".dmp", prefix="bin_gate_emu_")
-                try:
-                    os.write(fd, dump_bytes)
-                    result.success = True
-                    result.memory_dump_path = stable_path
-                    _emu_log(f"emulation docker: dump {len(dump_bytes)} bytes -> {stable_path}")
-                finally:
-                    os.close(fd)
-        except Exception as e:
-            result.error = f"emulation_docker_decode: {e}"
+    # Dump already parsed above (including on rc != 0). If no dump yet, treat report as success.
     if not result.success and report_dict:
         # Structured JSON output only (no Base64): success = report + modules
         result.success = True
@@ -636,21 +862,34 @@ def _run_speakeasy_emulation_via_docker(path: Path, timeout: int) -> EmulationRe
     return result
 
 
+# Themida/Enigma/Obsidium — усиленный профиль: timeout 120s (v1.2)
+ADVANCED_PROTECTOR_EXTENDED_NAMES = frozenset({"themida", "enigma", "obsidium"})
+
+# v3.0: adaptive_timeout — жёсткий предел и шаги для коммерческих протекторов (VMProtect/Themida)
+ADAPTIVE_MAX_API_CALLS_HARD_LIMIT = int(os.getenv("BIN_GATE_EMU_API_HARD_LIMIT", "15000"))
+ADAPTIVE_MAX_API_CALLS_MULTIPLIER = 2
+
 def run_emulation(
     path: Path,
     timeout: int = EMULATION_TIMEOUT_SEC,
     enable: bool = False,
     file_type: str = "PE",
+    complex_protector: bool = False,
+    extended_protector: bool = False,
 ) -> Dict[str, Any]:
     """
     Run emulation analysis on a binary file.
-    
+    complex_protector=True (VMProtect): timeout=60, max_api_calls=5000.
+    extended_protector=True (Themida/Enigma/Obsidium): timeout=120, max_api_calls=5000.
+
     Args:
         path: Path to the file
         timeout: Emulation timeout in seconds
         enable: Whether emulation is enabled (--emulation flag)
         file_type: "PE" or "ELF"
-        
+        complex_protector: True для VMProtect/сложных протекторов — больше API вызовов
+        extended_protector: True для Themida/Enigma/Obsidium — timeout 120s
+
     Returns:
         Dict with emulation results for Evidence.emulation
     """
@@ -688,8 +927,22 @@ def run_emulation(
         result_dict["error"] = f"unsupported_type:{file_type}"
         return result_dict
 
-    # Docker-only: no local Speakeasy fallback; container outputs JSON report + dump
-    emu_result = _run_speakeasy_emulation_via_docker(path, timeout)
+    if complex_protector or extended_protector:
+        max_api_calls = 5000
+        timeout = 120 if extended_protector else 60
+    else:
+        max_api_calls = 1000
+
+    # v3.0: adaptive_timeout — для коммерческих протекторов увеличиваем max_api_calls до дампа/OEP или жёсткого предела
+    use_adaptive = complex_protector or extended_protector
+    emu_result = _run_speakeasy_emulation_via_docker(path, timeout, max_api_calls=max_api_calls)
+    while use_adaptive and not emu_result.memory_dump_path and not (emu_result.success and getattr(emu_result, "api_summary", None)):
+        next_limit = min(max_api_calls * ADAPTIVE_MAX_API_CALLS_MULTIPLIER, ADAPTIVE_MAX_API_CALLS_HARD_LIMIT)
+        if next_limit <= max_api_calls:
+            break
+        max_api_calls = next_limit
+        _emu_log(f"adaptive_timeout: retry with max_api_calls={max_api_calls} (no dump yet)")
+        emu_result = _run_speakeasy_emulation_via_docker(path, timeout, max_api_calls=max_api_calls)
 
     # Convert to dict format
     result_dict["success"] = emu_result.success

@@ -106,7 +106,8 @@ SOURCE_SCRIPT_EXTS = {".sh", ".bash", ".ksh", ".zsh", ".py", ".rb", ".pl", ".lua
 CONFIG_EXTS = {".env", ".ini", ".cfg", ".conf", ".yaml", ".yml", ".json", ".toml", ".properties", ".config", ".xml"}
 
 BINARY_EXTS = {
-    ".exe", ".dll", ".sys", ".ocx", ".drv", *SOURCE_SCRIPT_EXTS, *CONFIG_EXTS,
+    ".exe", ".dll", ".sys", ".ocx", ".drv", ".cpl", ".xll", ".scr",  # CPL=XLL=SCR — расширения PE (DLL/EXE)
+    *SOURCE_SCRIPT_EXTS, *CONFIG_EXTS,
     ".elf", ".so", ".ko",
     ".dylib", ".bundle",
     ".bin", ".dat", ".out", ".msi",
@@ -123,7 +124,7 @@ BINARY_EXTS = {
 # Подмножество BINARY_EXTS, которое считаем «исполняемыми» для VT:
 # нативные бинарники и инсталляторы (PE/ELF/Mach-O, драйверы, .msi и пр.).
 VT_EXECUTABLE_EXTS = {
-    ".exe", ".dll", ".sys", ".ocx", ".drv",
+    ".exe", ".dll", ".sys", ".ocx", ".drv", ".cpl", ".xll", ".scr",  # CPL/XLL/SCR — PE
     ".elf", ".so", ".ko",
     ".dylib", ".bundle",
     ".bin", ".out", ".msi",
@@ -463,6 +464,58 @@ def _normalize_vt_behaviours(raw) -> list[dict]:
     return out
 
 
+def _build_vt_normalized_behavior(behaviours_list: list) -> dict:
+    """
+    Строит единую нормализованную структуру поведений VT из списка сессий.
+    Результат сохраняется в evidence.vt.normalized_behavior для кросс-верификации
+    с persistence_logic и network_profile.
+    """
+    if not behaviours_list or not isinstance(behaviours_list, list):
+        return {"registry_modified": [], "network": {"domains": [], "ips": [], "urls": []}, "processes": []}
+    registry_modified: list = []
+    domains: list = []
+    ips: list = []
+    urls: list = []
+    processes: list = []
+    seen_reg = set()
+    seen_dom = set()
+    seen_ip = set()
+    seen_url = set()
+    seen_proc = set()
+    for b in behaviours_list:
+        if not isinstance(b, dict):
+            continue
+        summ = b.get("summary") if isinstance(b.get("summary"), dict) else {}
+        for r in (b.get("registry") or summ.get("registry") or []):
+            if isinstance(r, str) and r.strip():
+                key = r.strip().lower().replace("/", "\\")
+                if key not in seen_reg:
+                    seen_reg.add(key)
+                    registry_modified.append(r.strip())
+        net = (b.get("network") if isinstance(b.get("network"), dict) else {}) or (summ.get("network") if isinstance(summ.get("network"), dict) else {})
+        for d in (net.get("domains") or []):
+            if isinstance(d, str) and d.strip() and d.strip() not in seen_dom:
+                seen_dom.add(d.strip())
+                domains.append(d.strip())
+        for i in (net.get("ips") or []):
+            if isinstance(i, str) and i.strip() and i.strip() not in seen_ip:
+                seen_ip.add(i.strip())
+                ips.append(i.strip())
+        for u in (net.get("urls") or []):
+            if isinstance(u, str) and u.strip() and u.strip() not in seen_url:
+                seen_url.add(u.strip())
+                urls.append(u.strip())
+        for p in (b.get("processes") or summ.get("processes") or []):
+            s = p if isinstance(p, str) else (p.get("name") or p.get("path") or p.get("command") or str(p)) if isinstance(p, dict) else str(p)
+            if s and s.strip() and s.strip() not in seen_proc:
+                seen_proc.add(s.strip())
+                processes.append(s.strip())
+    return {
+        "registry_modified": registry_modified,
+        "network": {"domains": domains, "ips": ips, "urls": urls},
+        "processes": processes,
+    }
+
 
 def run_kaspersky_scan(scan_root: str, avp_path: str, timeout_s: int = 900) -> dict:
     """
@@ -783,6 +836,9 @@ def main(argv: list[str] | None = None) -> int:
     # profile + human + reporters
     p_scan.add_argument("--profile", choices=["dev","staging","prod"], default=os.getenv("BIN_GATE_PROFILE","dev"),
                         help="Policy profile (dev/staging/prod). Env: BIN_GATE_PROFILE")
+    p_scan.add_argument("--analysis-profile", dest="analysis_profile", choices=["fast", "balanced", "deep"],
+                        default=os.getenv("ANALYSIS_PROFILE", "balanced"),
+                        help="Analysis intensity: fast (CI/PR <15s), balanced (30-60s), deep (full unpack+emulation). Env: ANALYSIS_PROFILE")
     p_scan.add_argument("--human-out", default=None,
                         help="Path to human-friendly report (Markdown, RU). Default: BIN_GATE_HUMAN_OUT_DEFAULT env (CLI overrides env)")
     p_scan.add_argument("--sarif-out", default=None, help="Write SARIF v2.1.0 report to this path (e.g., sarif.json)")
@@ -1678,6 +1734,26 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as e:
                 ev.errors.append(f"strings_iocs_error:{e}")
 
+            # Persistence и сетевой профиль (для кросс-верификации с VT behaviour)
+            try:
+                persist_strings = []
+                for bucket in ("static", "decoded"):
+                    persist_strings.extend((ev.strings or {}).get(bucket, [])[:1500])
+                if (ev.die or {}).get("strings"):
+                    persist_strings.extend((ev.die or {})["strings"][:500])
+                if (getattr(ev, "emulation", None) or {}).get("decoded_strings"):
+                    persist_strings.extend((ev.emulation or {}).get("decoded_strings", [])[:300])
+                if persist_strings:
+                    from .analyzers.persistence_logic import analyze_persistence
+                    ev.persistence_analysis = analyze_persistence(persist_strings)
+                net_strings = list(persist_strings) if persist_strings else []
+                if net_strings:
+                    from .analyzers.network_profile import analyze_network_profile
+                    _ev_dict = {"pe": getattr(ev, "pe", None), "meta": getattr(ev, "meta", None)}
+                    ev.network_profile = analyze_network_profile(net_strings, ev=_ev_dict)
+            except Exception as e:
+                ev.errors.append(f"persistence_network_analysis_error:{e}")
+
             if not args.no_yara:
                 try:
                     yara_hits = run_yara(
@@ -1937,6 +2013,7 @@ def main(argv: list[str] | None = None) -> int:
                         ev.vt["behaviours"] = _norm
                         ev.vt["behaviours_count"] = len(_norm)
                         ev.vt["_beh_attached"] = True
+                        ev.vt["normalized_behavior"] = _build_vt_normalized_behavior(_norm)
                         ev.errors.append(f"vt_dbg:cache_norm ok sessions={len(_norm)}")
                 # --- RAW behaviours (единственный источник) ---
                 try:
@@ -1955,6 +2032,7 @@ def main(argv: list[str] | None = None) -> int:
                         ev.vt["behaviours"] = []
                         ev.vt["behaviours_count"] = 0
                         ev.vt.pop("_beh_attached", None)
+                        ev.vt["normalized_behavior"] = _build_vt_normalized_behavior([])
 
                     # ❷ Маяк решения перед условием
                     _empty = _behaviours_effectively_empty(ev.vt)
@@ -1979,6 +2057,7 @@ def main(argv: list[str] | None = None) -> int:
                             ev.vt["behaviours"] = ui_cand
                             ev.vt["behaviours_count"] = len(ui_cand)
                             ev.vt["_beh_attached"] = True
+                            ev.vt["normalized_behavior"] = _build_vt_normalized_behavior(ui_cand)
                             ev.vt["_cached"] = False
                             _vt_dbg(ev, stage="cache_hit_after_ui", sha256=sha256, vt_data=ev.vt, note="ui scrape OK", args=args)
                         # --- Дополняем API-сессиями (мерж UI + API), если есть ключ ---
@@ -2011,6 +2090,7 @@ def main(argv: list[str] | None = None) -> int:
                                 ev.vt["behaviours"] = existing
                                 ev.vt["behaviours_count"] = len(existing)
                                 ev.vt["_beh_attached"] = True
+                                ev.vt["normalized_behavior"] = _build_vt_normalized_behavior(existing)
                                 ev.vt["_cached"] = False
                                 vt_debug_log(f"[vt_debug] sha256={sha256} merged sessions={len(existing)}")
                                 # Relations (как в vt.py: contacted_domains/ips/urls) для отчёта
@@ -2062,6 +2142,7 @@ def main(argv: list[str] | None = None) -> int:
                                 ev.vt["behaviours"] = cand
                                 ev.vt["behaviours_count"] = len(cand)
                                 ev.vt["_beh_attached"] = True
+                                ev.vt["normalized_behavior"] = _build_vt_normalized_behavior(cand)
                                 ev.vt["_cached"] = False
                                 _vt_dbg(ev, stage="cache_hit_after_raw", sha256=sha256, vt_data=ev.vt, note="raw plural OK", args=args)
                     else:
@@ -2167,6 +2248,7 @@ def main(argv: list[str] | None = None) -> int:
                                 vt_data["behaviours"] = ui_cand
                                 vt_data["behaviours_count"] = len(ui_cand)
                                 vt_data["_beh_attached"] = True
+                                vt_data["normalized_behavior"] = _build_vt_normalized_behavior(ui_cand)
                                 cache.put("vt_full", vt_data.get("sha256", base_sha), vt_data)
                             else:
                                 _cli_dbg(f"vt_wait_behaviours_raw CALL sha256={base_sha[:16]}... call_site=no_cache_behaviour_empty")
@@ -2185,6 +2267,7 @@ def main(argv: list[str] | None = None) -> int:
                                     vt_data["behaviours"] = cand
                                     vt_data["behaviours_count"] = len(cand)
                                     vt_data["_beh_attached"] = True
+                                    vt_data["normalized_behavior"] = _build_vt_normalized_behavior(cand)
                                     cache.put("vt_full", vt_data.get("sha256", base_sha), vt_data)
                                 else:
                                     vt_data.pop("behaviours", None)
@@ -2256,6 +2339,7 @@ def main(argv: list[str] | None = None) -> int:
                                             vt_data["behaviours"] = ui_cand
                                             vt_data["behaviours_count"] = len(ui_cand)
                                             vt_data["_beh_attached"] = True
+                                            vt_data["normalized_behavior"] = _build_vt_normalized_behavior(ui_cand)
                                             cache.put("vt_full", vt_data.get("sha256", base_sha), vt_data)
                                         else:
                                             _cli_dbg(f"vt_wait_behaviours_raw CALL sha256={base_sha[:16]}... call_site=upload_path_behaviour_empty")
@@ -2274,6 +2358,7 @@ def main(argv: list[str] | None = None) -> int:
                                                 vt_data["behaviours"] = cand
                                                 vt_data["behaviours_count"] = len(cand)
                                                 vt_data["_beh_attached"] = True
+                                                vt_data["normalized_behavior"] = _build_vt_normalized_behavior(cand)
                                                 cache.put("vt_full", vt_data.get("sha256", base_sha), vt_data)
                                             else:
                                                 vt_data.pop("behaviours", None)
@@ -2314,6 +2399,22 @@ def main(argv: list[str] | None = None) -> int:
                     ev.vt = vt_data
                     cache.put("vt_full", vt_data.get("sha256", sha256), vt_data)
 
+            # Кросс-верификация persistence/network с VT behaviour (normalized_behavior)
+            _vt_nb = (getattr(ev, "vt", None) or {}).get("normalized_behavior")
+            if _vt_nb:
+                try:
+                    from .analyzers.persistence_logic import merge_persistence_with_vt
+                    from .analyzers.network_profile import merge_network_with_vt
+                    if getattr(ev, "persistence_analysis", None):
+                        ev.persistence_analysis = merge_persistence_with_vt(ev.persistence_analysis, _vt_nb)
+                    if getattr(ev, "network_profile", None):
+                        ev.network_profile = merge_network_with_vt(
+                            ev.network_profile,
+                            getattr(ev, "threat_intel", None),
+                            _vt_nb,
+                        )
+                except Exception as _mex:
+                    ev.errors.append(f"vt_behavior_merge_error:{_mex}")
 
         # --- POLICY (для всех типов, включая python-пакеты) ---
         ev_dict = ev.to_dict()

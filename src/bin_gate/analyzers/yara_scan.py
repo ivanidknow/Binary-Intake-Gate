@@ -1,7 +1,11 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
-import os, sys, hashlib, json, time
+import os, sys, re, hashlib, json, time
+
+# MITRE ID pattern: T + digits + optional .digits (e.g. T1055, T1055.012) — raw string to avoid SyntaxWarning
+_MITRE_ID_PATTERN = re.compile(r"T\d+(\.\d+)?", re.IGNORECASE)
+# Примечание: max_strings_per_rule — опция только CLI YARA; в yara-python при too many matches используем fast=True и max_hits
 
 # ======== РАЗУМНЫЕ ДЕФОЛТЫ (можно переопределять флагами/ENV) ========
 DEFAULT_TIMEOUT_SEC = int(os.getenv("YARA_TIMEOUT_SEC", "7"))
@@ -72,6 +76,12 @@ TECHNIQUE_KEYWORDS = {
     "wiper": "impact",
     "encrypt": "impact",
     "destruct": "impact",
+}
+
+# Маппинг имён правил/категорий в MITRE ID (для meta без technique/mitre/attack)
+RULE_MITRE_MAP = {
+    "antivirus": "T1562",           # Impair Defenses (отключение AV)
+    "win_files_operation": "T1570", # Lateral Tool Transfer
 }
 
 # ======== ВСТРОЕННЫЕ «БЕЗОПАСНЫЕ» ПРАВИЛА (минимум FP) ========
@@ -188,6 +198,80 @@ def _compile_from_dir(yara, rules_dir: Path):
     if not filepaths:
         return None
     return yara.compile(filepaths=filepaths)
+
+
+def _get_external_rules_dir() -> Optional[Path]:
+    """Директория rules/external/ (внешние базы Yara-Rules, Neo23x0)."""
+    try:
+        from ..rules import get_external_rules_dir
+        d = get_external_rules_dir()
+        return d if d.exists() else None
+    except Exception:
+        return None
+
+
+def _compile_external_dir(yara, external_dir: Path) -> Tuple[List[Tuple[Any, str]], List[str]]:
+    """
+    Компиляция всех .yar из external (рекурсивно). При ошибке «всего сразу» — по файлам (пропуск сломанных).
+    Возвращает ([(rules_obj, namespace)], errors).
+    """
+    errors: List[str] = []
+    files = sorted(external_dir.rglob("*.yar*"))
+    filepaths = {str(p): str(p) for p in files if p.is_file()}
+    if not filepaths:
+        return [], errors
+    # Сначала пробуем скомпилировать всё
+    try:
+        rules = yara.compile(filepaths=filepaths)
+        ns = external_dir.name
+        return [(rules, ns)], errors
+    except Exception as e:
+        errors.append(f"external_compile_all:{e}")
+    # Пофайлово: компилируем каждый, сломанные пропускаем
+    result: List[Tuple[Any, str]] = []
+    for p in files:
+        if not p.is_file():
+            continue
+        try:
+            r = yara.compile(filepath=str(p))
+            ns = str(p.relative_to(external_dir).parent).replace("\\", "/") or p.parent.name
+            result.append((r, ns))
+        except Exception as e:
+            errors.append(f"skip {p.name}: {e}")
+    return result, errors
+
+
+def _load_external_rules() -> Tuple[List[Tuple[Any, str]], List[str]]:
+    """
+    Загрузка/компиляция правил из rules/external/. Кэш .yarac по fingerprint директории.
+    Возвращает ([(rules, namespace)], errors).
+    """
+    external_dir = _get_external_rules_dir()
+    if not external_dir or not external_dir.exists():
+        return [], []
+    try:
+        import yara  # type: ignore
+    except Exception:
+        return [], []
+    errors: List[str] = []
+    fp = _fingerprint_rules_dir(external_dir)
+    cache_dir = _cache_base_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"external_{fp}.yarac"
+    if cache_file.exists():
+        try:
+            rules = yara.load(str(cache_file))
+            return [(rules, "external")], errors
+        except Exception as e:
+            errors.append(f"external_cache_load:{e}")
+    rules_list, compile_errs = _compile_external_dir(yara, external_dir)
+    errors.extend(compile_errs)
+    if len(rules_list) == 1:
+        try:
+            rules_list[0][0].save(str(cache_file))
+        except Exception as e:
+            errors.append(f"external_cache_save:{e}")
+    return rules_list, errors
 
 def _load_or_compile_rules(rules_dir: Optional[Path], use_builtin: bool) -> Tuple[Optional[Any], List[str]]:
     """
@@ -334,6 +418,10 @@ def _extract_techniques_from_match(rule_name: str, meta: Dict[str, Any], tags: L
     for keyword, technique in TECHNIQUE_KEYWORDS.items():
         if keyword in rule_lower:
             techniques.add(technique)
+    # 4b. Прямой маппинг правила -> MITRE ID (Antivirus -> T1562, win_files_operation -> T1570)
+    for rule_key, mitre_id in RULE_MITRE_MAP.items():
+        if rule_key in rule_lower:
+            techniques.add(mitre_id.upper())
 
     # 5. Из тегов
     for tag in tags:
@@ -404,48 +492,122 @@ def run_yara(
             if isinstance(v, (int, float, str, bool)):
                 ext[k] = v
 
-    # Скан
-    try:
-        matches = rules.match(
-            str(path),
-            externals=ext,
-            timeout=timeout_sec,
-            fast=fast
-        )
-    except Exception as e:
-        return [{"rule": "yara_match_error", "namespace": "errors", "meta": {"error": str(e)[:400]}}]
-
-    # Нормализация и сортировка по severity → затем по имени
-    out: List[Dict[str, Any]] = []
-    for m in matches:
+    def norm_match(m: Any) -> Dict[str, Any]:
         meta = dict(m.meta) if hasattr(m, "meta") else {}
         sev = _norm_severity(meta)
         tags = list(getattr(m, "tags", []) or [])
-        # Извлекаем техники ATT&CK из метаданных
         techniques = _extract_techniques_from_match(m.rule, meta, tags)
-        out.append({
+        return {
             "rule": m.rule,
-            "namespace": m.namespace,
+            "namespace": getattr(m, "namespace", "") or "",
             "meta": meta,
             "severity": sev,
             "tags": tags,
-            "techniques": sorted(techniques),  # ATT&CK techniques extracted
-        })
+            "techniques": sorted(techniques),
+        }
+
+    # Global fast mode: при fast=True YARA останавливается после первого совпадения строки (критично для PoetRat_Python, Microsoft_Visual_Cpp) — избегаем RuntimeWarning: too many matches. Для Deep профиля вызывающий передаёт fast=False.
+    try:
+        matches = rules.match(str(path), externals=ext, timeout=timeout_sec, fast=fast)
+    except Exception as e:
+        return [{"rule": "yara_match_error", "namespace": "errors", "meta": {"error": str(e)[:400]}}]
+
+    out: List[Dict[str, Any]] = [norm_match(m) for m in matches]
+
+    # Скан внешних баз (rules/external/) — пофайловый кэш при ошибке компиляции всего
+    external_list, _ = _load_external_rules()
+    for rules_ext, ns_prefix in external_list:
+        try:
+            for m in rules_ext.match(str(path), externals=ext, timeout=max(2, timeout_sec // 2), fast=fast):
+                rec = norm_match(m)
+                rec["namespace"] = ns_prefix + "/" + rec.get("namespace", "") if rec.get("namespace") else ns_prefix
+                out.append(rec)
+        except Exception:
+            continue
 
     sev_order = {"critical": 3, "high": 2, "medium": 1, "low": 0}
     out.sort(key=lambda x: (sev_order.get(x.get("severity","medium"), 1), str(x.get("rule"))), reverse=True)
+    # Ограничение числа хитов (max_hits) снижает риск "too many matches" и ускоряет обработку
     if len(out) > max_hits:
         out = out[:max_hits]
         out.append({"rule": "yara_truncated", "namespace": "meta", "meta": {"max_hits": max_hits}})
     return out
 
 
+def run_yara_on_data(
+    data: bytes,
+    rules_dir: str | None = None,
+    *,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    max_hits: int = DEFAULT_MAX_HITS,
+    fast: bool = DEFAULT_FAST_MODE,
+    use_builtin: bool = DEFAULT_USE_BUILTIN,
+) -> List[Dict[str, Any]] | None:
+    """
+    v3.0: YARA по буферу (для островов энтропии в streaming_scanner).
+    Не загружает файл в RAM целиком — вызывающий передаёт только нужный кусок.
+    """
+    try:
+        import yara  # type: ignore
+    except Exception:
+        return None
+    rules, errs = _load_or_compile_rules(Path(rules_dir) if rules_dir else None, use_builtin)
+    if rules is None:
+        return [{"rule": "yara_error", "namespace": "errors", "meta": {"errors": errs}}]
+    ext = {
+        "is_pe": 1 if data[:2] == b"MZ" else 0,
+        "is_elf": 1 if data[:4] == b"\x7fELF" else 0,
+        "file_size": len(data),
+    }
+
+    def norm_match(m: Any) -> Dict[str, Any]:
+        meta = dict(m.meta) if hasattr(m, "meta") else {}
+        sev = _norm_severity(meta)
+        tags = list(getattr(m, "tags", []) or [])
+        techniques = _extract_techniques_from_match(m.rule, meta, tags)
+        return {
+            "rule": m.rule,
+            "namespace": getattr(m, "namespace", "") or "",
+            "meta": meta,
+            "severity": sev,
+            "tags": tags,
+            "techniques": sorted(techniques),
+        }
+
+    try:
+        matches = rules.match(data=data, externals=ext, timeout=timeout_sec, fast=fast)
+    except Exception as e:
+        return [{"rule": "yara_match_error", "namespace": "errors", "meta": {"error": str(e)[:400]}}]
+    out = [norm_match(m) for m in matches]
+    if len(out) > max_hits:
+        out = out[:max_hits]
+        out.append({"rule": "yara_truncated", "namespace": "meta", "meta": {"max_hits": max_hits}})
+    return out
+
+
+def _normalize_mitre_id(s: str) -> str:
+    """MITRE IDs (pattern T\\d+ or T\\d+\\.\\d+) в верхнем регистре для Evidence. Использует r'T\\d+(\\.\\d+)?' без SyntaxWarning."""
+    s = (s or "").strip()
+    if not s:
+        return s
+    m = _MITRE_ID_PATTERN.search(s)
+    if m:
+        return m.group(0).upper()
+    if len(s) >= 2 and s[0].lower() == "t" and s[1:].replace(".", "").isdigit():
+        return s.upper()
+    return s
+
+
 def extract_all_techniques(yara_hits: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
     """
     Агрегирует все техники и rule_hits из YARA результатов.
+    Парсит meta.technique, meta.mitre, meta.attack из правил.
     Возвращает (techniques, rule_hits) для заполнения Evidence.capa.
+    MITRE ID в едином формате (T1562, T1546.012, без дублей).
+    rule_hits дедуплицированы (IsPE32 и др. не дублируются).
     """
     all_techniques: Set[str] = set()
+    rule_hits_seen: Set[str] = set()
     rule_hits: List[str] = []
 
     for hit in yara_hits:
@@ -453,10 +615,21 @@ def extract_all_techniques(yara_hits: List[Dict[str, Any]]) -> Tuple[List[str], 
             continue
         rule_name = hit.get("rule", "")
         if rule_name:
-            rule_hits.append(f"YARA:{rule_name}")
+            key = f"YARA:{rule_name}"
+            if key not in rule_hits_seen:
+                rule_hits_seen.add(key)
+                rule_hits.append(key)
         techniques = hit.get("techniques") or []
+        if not techniques and hit.get("meta"):
+            techniques = _extract_techniques_from_match(
+                rule_name,
+                hit.get("meta", {}),
+                hit.get("tags") or [],
+            )
         for t in techniques:
             if t:
-                all_techniques.add(t)
+                norm = _normalize_mitre_id(t) if isinstance(t, str) else str(t)
+                if norm:
+                    all_techniques.add(norm)
 
     return sorted(all_techniques), rule_hits[:50]

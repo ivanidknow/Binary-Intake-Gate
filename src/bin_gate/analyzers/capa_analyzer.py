@@ -63,6 +63,28 @@ def _extract_tactics_from_rule(rule: dict) -> List[str]:
             tactics.add(v)
     return sorted(tactics)
 
+
+def _extract_attck_by_tactic(rule: dict) -> List[tuple]:
+    """Из meta.att&ck извлекает пары (tactic, technique_id) для матрицы MITRE ATT&CK."""
+    result: List[tuple] = []
+    meta = rule.get("meta", {})
+    atk = meta.get("att&ck") or meta.get("attack") or []
+    if not isinstance(atk, list):
+        return result
+    for item in atk:
+        if not isinstance(item, dict):
+            continue
+        tactic = (item.get("tactic") or "").strip().lower().replace(" ", "-")
+        tid = (item.get("id") or item.get("technique") or "").strip()
+        if tactic:
+            result.append((tactic, tid or meta.get("name") or rule.get("name") or ""))
+    # Keyword fallback: по имени правила
+    name = (meta.get("name") or rule.get("name") or "").lower()
+    for k, v in KEYWORDS_TO_TACTICS.items():
+        if k in name and not any(r[0] == v for r in result):
+            result.append((v, name[:80]))
+    return result
+
 def run_capa(
     path: Path,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
@@ -96,6 +118,13 @@ def run_capa(
         if prefilled_techniques:
             out["tactics"] = sorted(set(prefilled_techniques))
             out["techniques"] = sorted(set(prefilled_techniques))
+            # Матрица по тактикам для отчёта (YARA/DIE не дают id, используем имя тактики)
+            by_t: Dict[str, List[str]] = {}
+            for t in out["tactics"]:
+                by_t.setdefault(t, []).append(t)
+            out["attck_by_tactic"] = by_t
+        else:
+            out["attck_by_tactic"] = {}
         if prefilled_rule_hits:
             out["rule_hits"] = prefilled_rule_hits[:50]
         out["source"] = "yara_die"
@@ -176,6 +205,7 @@ def run_capa(
 
     hits: List[str] = []
     tactics: Set[str] = set()
+    attck_by_tactic: Dict[str, List[str]] = {}
     for r in rules:
         meta = r.get("meta", {})
         name = meta.get("name") or r.get("name")
@@ -183,17 +213,26 @@ def run_capa(
             hits.append(str(name))
         for t in _extract_tactics_from_rule(r):
             tactics.add(t)
+        for tactic, tech_id in _extract_attck_by_tactic(r):
+            if tactic not in attck_by_tactic:
+                attck_by_tactic[tactic] = []
+            if tech_id and tech_id not in attck_by_tactic[tactic]:
+                attck_by_tactic[tactic].append(tech_id)
 
     # Мержим с YARA/DIE данными
     if prefilled_techniques:
         for t in prefilled_techniques:
             tactics.add(t)
+            tstr = str(t).lower().replace("_", "-")
+            if tstr and tstr not in (attck_by_tactic.get(tstr) or []):
+                attck_by_tactic.setdefault(tstr, []).append(str(t))
     if prefilled_rule_hits:
         hits.extend(prefilled_rule_hits)
 
     out["rule_hits"] = sorted(set(hits))[:50]
     out["tactics"] = sorted(tactics)
     out["techniques"] = sorted(tactics)
+    out["attck_by_tactic"] = {k: list(v)[:30] for k, v in attck_by_tactic.items()}
     return out
 
 

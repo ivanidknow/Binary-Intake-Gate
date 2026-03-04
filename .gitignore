@@ -23,6 +23,8 @@ __pycache__/
 # Temporary directories
 .tmp_bin_gate/
 .tmp/
+.tmp_gitleaks/
+.tmp_gitleaks_report.json
 temp/
 
 # Archives
@@ -62,4 +64,18 @@ desktop.ini
 
 # Test examples (large binaries)
 examples/
+
+# YARA External Rules & Compiled Cache
+src/bin_gate/rules/external/*
+!src/bin_gate/rules/external/.gitkeep
+*.yarac
+*.yarc
+
+# Emulation & Deep Memory Scan
+*.dmp
+.tmp_gitleaks/
+.tmp_gitleaks_report.json
+
+# Test Methodology Results
+methodology_results.json
 

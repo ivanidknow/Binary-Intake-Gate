@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set, Tuple
 
 _emu_log_lock = threading.Lock()
 
@@ -30,13 +30,21 @@ TI_TIMEOUT = int(__import__("os").getenv("BIN_GATE_TI_TIMEOUT", "30"))
 
 # Aggressive gating: files > 50 MB that are not archive/MSI run only hashes, entropy, YARA
 AGGRESSIVE_GATE_MB = 50
+# v2.0: файлы > 200 МБ — бинарный padding (T1027.001), ленивый анализ без загрузки в память
+GIANT_FILE_THRESHOLD_BYTES = 200 * 1024 * 1024
 ARCHIVE_MSI_SUFFIXES = frozenset({".zip", ".msi", ".jar", ".apk", ".aab", ".7z", ".rar", ".tar", ".gz", ".tgz", ".whl", ".nupkg", ".msix", ".appx", ".vsix", ".deb", ".rpm", ".ova", ".ovf"})
 
 
-def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dict[str, Any]:
+def run_one_file_analysis(
+    path: Path,
+    kind: str,
+    options: Dict[str, Any],
+    yara_input_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     """
     Run all CPU-bound and local analyzers for one file. Returns evidence-like dict
     (no vt, no cve). All subprocess calls use hard timeouts. Errors go to evidence["errors"].
+    yara_input_path: если задан (e.g. распакованный UPX), YARA запускается по нему вместо path.
     """
     path = Path(path)
     t0 = time.perf_counter()
@@ -51,6 +59,7 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
         and not options.get("deep_scan")
         and not is_archive_or_msi
     )
+    is_giant = file_size > GIANT_FILE_THRESHOLD_BYTES
     out: Dict[str, Any] = {
         "meta": {
             "path": str(path),
@@ -84,6 +93,13 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
         "source": None,
         "reputation": {"findings": [], "counts": {}, "categories": []},
     }
+    if is_giant:
+        out["binary_padding"] = {
+            "detected": True,
+            "size_mb": round(file_size / (1024 * 1024), 2),
+            "lazy_analyzed": True,
+            "mitre": "T1027.001",
+        }
 
     def opt(key: str, default: Any = None) -> Any:
         return options.get(key, default)
@@ -112,6 +128,17 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
             if peinfo.get("errors"):
                 errors.extend(peinfo["errors"])
             out["entropy"]["sections"] = sections_entropy_pe(path)
+            # Кроссплатформенная проверка подписи и отзыва (osslsigncode + OCSP)
+            try:
+                from .signing_trust import analyze as analyze_signing_trust
+                st = analyze_signing_trust(path)
+                sig = out["pe"].setdefault("signature", {})
+                if st.get("revoked") is not None:
+                    sig["revoked"] = st["revoked"]
+                if st.get("valid") is not None and sig.get("valid") is None:
+                    sig["valid"] = st["valid"]
+            except Exception as e2:
+                errors.append(f"signing_trust_error:{e2}")
         except Exception as e:
             errors.append(f"pe_error:{e}")
     elif kind == "ELF":
@@ -141,10 +168,11 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
         # Only hashes, entropy, YARA for large non-archive files
         if not opt("no_yara"):
             t_y = time.perf_counter()
+            _yara_path = (yara_input_path if yara_input_path and yara_input_path.exists() else path)
             try:
                 from .yara_scan import run_yara
                 yara_hits = run_yara(
-                    path,
+                    _yara_path,
                     rules_dir=opt("yara_rules"),
                     timeout_sec=int(opt("yara_timeout", 7)),
                     max_mb=int(opt("yara_max_mb", 0)),
@@ -154,10 +182,37 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
                     externals=yara_externals,
                 )
                 if yara_hits is not None:
-                    out["yara"] = yara_hits
+                    _seen: Set[Tuple[str, str]] = set()
+                    _deduped: List[Dict[str, Any]] = []
+                    for h in yara_hits:
+                        if not isinstance(h, dict):
+                            _deduped.append(h)
+                            continue
+                        _key = (str(h.get("rule", "")), str(h.get("namespace", "")))
+                        if _key not in _seen:
+                            _seen.add(_key)
+                            _deduped.append(h)
+                    out["yara"] = _deduped
             except Exception as e:
                 errors.append(f"yara_error:{e}")
             yara_sec = time.perf_counter() - t_y
+        # v3.0: потоковый анализ гигантских файлов — карта энтропии + YARA по островам (энтропия > 6.0)
+        if is_giant:
+            try:
+                from .streaming_scanner import streaming_entropy_and_yara
+                max_chunks = min(2048, (file_size // (1024 * 1024)) + 1) if file_size else 2048
+                stream_res = streaming_entropy_and_yara(
+                    path,
+                    rules_dir=opt("yara_rules"),
+                    max_chunks=max_chunks,
+                )
+                out["streaming_scan"] = stream_res
+                island_hits = stream_res.get("yara_island_hits") or []
+                if island_hits:
+                    out.setdefault("yara", [])
+                    out["yara"].extend(island_hits)
+            except Exception as e:
+                errors.append(f"streaming_scan_error:{e}")
         wall_sec = time.perf_counter() - t0
         out["_timing"] = {"wall_sec": wall_sec, "capa_sec": 0.0, "die_sec": 0.0, "yara_sec": yara_sec, "slowest": "yara" if yara_sec else "none", "aggressive_skip": True}
         return out
@@ -235,13 +290,14 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
             errors.append(f"die_error:{e}")
         die_sec = time.perf_counter() - t_die
 
-    # --- YARA ---
+    # --- YARA (при pre_analysis_dispatch UPX используем распакованный файл) ---
     if not opt("no_yara"):
         t_yara = time.perf_counter()
+        yara_path = (yara_input_path if yara_input_path and yara_input_path.exists() else path)
         try:
             from .yara_scan import run_yara
             yara_hits = run_yara(
-                path,
+                yara_path,
                 rules_dir=opt("yara_rules"),
                 timeout_sec=int(opt("yara_timeout", 7)),
                 max_mb=int(opt("yara_max_mb", 0)),
@@ -251,7 +307,18 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
                 externals=yara_externals,
             )
             if yara_hits is not None:
-                out["yara"] = yara_hits
+                # Дедупликация по (rule, namespace), чтобы правила вроде IsPE32 не дублировались в highlights
+                seen: Set[Tuple[str, str]] = set()
+                deduped: List[Dict[str, Any]] = []
+                for h in yara_hits:
+                    if not isinstance(h, dict):
+                        deduped.append(h)
+                        continue
+                    key = (str(h.get("rule", "")), str(h.get("namespace", "")))
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(h)
+                out["yara"] = deduped
         except Exception as e:
             errors.append(f"yara_error:{e}")
         yara_sec = time.perf_counter() - t_yara
@@ -282,6 +349,15 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
                 )
                 if obf:
                     out["obfuscation"].update(obf)
+                # Entropy trigger: > 7.2 → High Risk Obfuscated, требуется manual review
+                try:
+                    from .entropy import file_entropy
+                    file_e = out.get("entropy", {}).get("file") or (file_entropy(path) if path.exists() else None)
+                    max_sec = out.get("obfuscation", {}).get("max_section_entropy")
+                    if (max_sec is not None and float(max_sec) > 7.2) or (file_e is not None and float(file_e) > 7.2):
+                        out.setdefault("obfuscation", {})["manual_review_required"] = True
+                except Exception:
+                    pass
         except Exception as e:
             errors.append(f"obf_error:{e}")
 
@@ -318,11 +394,12 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
             )
 
             if capa_res.get("status") == "timeout":
-                out["capa"] = {"status": "timeout", "techniques": capa_res.get("techniques", []), "rule_hits": capa_res.get("rule_hits", [])}
+                out["capa"] = {"status": "timeout", "techniques": capa_res.get("techniques", []), "rule_hits": capa_res.get("rule_hits", []), "attck_by_tactic": capa_res.get("attck_by_tactic", {})}
             else:
                 out["capa"] = {
                     "techniques": capa_res.get("techniques", []),
                     "rule_hits": capa_res.get("rule_hits", []),
+                    "attck_by_tactic": capa_res.get("attck_by_tactic", {}),
                     "source": capa_res.get("source", "unknown"),
                 }
 
@@ -376,6 +453,8 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
         try:
             from .office_pdf_lnk import analyze as analyze_office_pdf_lnk
             out["docscripts"] = analyze_office_pdf_lnk(path)
+            if out["docscripts"] and out["docscripts"].get("technique_hints"):
+                out["technique_hints"] = list(out["docscripts"].get("technique_hints") or [])
         except Exception as e:
             errors.append(f"docscripts_error:{e}")
 
@@ -392,6 +471,17 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
             out["archive_meta"] = analyze_jar_apk(path)
         except Exception as e:
             errors.append(f"archive_meta_error:{e}")
+        # v2.0 T1027.006 Tauri/WebView smuggling: assets с обфусцированным JS
+        try:
+            from .tauri_webview import analyze_archive_for_tauri_webview
+            tw = analyze_archive_for_tauri_webview(path)
+            if tw.get("detected"):
+                out["tauri_webview_smuggling"] = tw
+                th = out.get("technique_hints") or []
+                if "T1027.006" not in th:
+                    out["technique_hints"] = sorted(set(th + ["T1027.006"]))
+        except Exception as e:
+            errors.append(f"tauri_webview_error:{e}")
 
     if sfx in (".php", ".asp", ".aspx", ".jsp"):
         try:
@@ -401,55 +491,95 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
             errors.append(f"webshell_error:{e}")
 
     # -------------------------------------------------------------------------
+    # Short-circuit: если статика уже дала критическую малварь — не запускать эмуляцию (Enterprise Fast-fail)
+    # -------------------------------------------------------------------------
+    def _static_critical_deny(ev: Dict[str, Any]) -> bool:
+        for h in ev.get("yara") or []:
+            if not isinstance(h, dict):
+                continue
+            ns = (h.get("namespace") or "").lower()
+            meta = h.get("meta") or {}
+            cat = str(meta.get("category") or meta.get("family") or "").lower()
+            if "malware" in ns or "malware" in cat:
+                return True
+        pe = ev.get("pe") or {}
+        if isinstance(pe, dict) and (pe.get("signature") or {}).get("revoked") is True:
+            return True
+        return False
+
+    if _static_critical_deny(out):
+        out["short_circuit_deny"] = True
+
+    # -------------------------------------------------------------------------
     # Advanced Malware Detection (v0.0.8)
     # -------------------------------------------------------------------------
     emulation_sec = 0.0
     ti_sec = 0.0
-    
+
     # Initialize v0.0.8 fields
     out["emulation"] = None
     out["threat_intel"] = None
     out["visual"] = None
     out["script_analysis"] = None
-    
-    # --- Emulation (Speakeasy) ---
-    # Force emulation when VMProtect is detected (DIE/obfuscation) so CVE gets the memory dump even in batch mode
-    _force_emulation_vmprotect = False
-    die = out.get("die") or {}
-    if isinstance(die, dict):
+
+    # --- Emulation (Speakeasy): пропуск при short_circuit_deny ---
+    # Решение по эмуляции: unpacker_orchestrator (UPX/MPRESS → static; Themida/VMProtect → aggressive_emulation)
+    _force_emulation_advanced = False
+    _extended_protector_120 = False
+    try:
+        from .unpacker_orchestrator import get_unpack_decision
+        decision = get_unpack_decision(path, die_info=out.get("die"), obfuscation=out.get("obfuscation"))
+        if decision.get("aggressive_emulation"):
+            _force_emulation_advanced = True
+            families = decision.get("packer_families") or []
+            if any(x in str(p).lower() for p in families for x in ("themida", "enigma", "obsidium")):
+                _extended_protector_120 = True
+    except Exception:
+        pass
+    if not _force_emulation_advanced:
+        from .emulation import ADVANCED_PROTECTOR_EXTENDED_NAMES
+        die = out.get("die") or {}
         for d in die.get("detects") or []:
-            if isinstance(d, str) and "vmprotect" in d.lower():
-                _force_emulation_vmprotect = True
+            name = (d.get("name") or d.get("sName") or "") if isinstance(d, dict) else str(d)
+            name_lower = name.lower()
+            if "vmprotect" in name_lower or "themida" in name_lower or "enigma" in name_lower or "obsidium" in name_lower:
+                _force_emulation_advanced = True
+                if any(x in name_lower for x in ADVANCED_PROTECTOR_EXTENDED_NAMES):
+                    _extended_protector_120 = True
                 break
-            if isinstance(d, dict) and "vmprotect" in (d.get("name") or d.get("sName") or "").lower():
-                _force_emulation_vmprotect = True
-                break
-    if not _force_emulation_vmprotect:
+    if not _force_emulation_advanced:
         obf = out.get("obfuscation") or {}
         if isinstance(obf, dict):
             packers = obf.get("packer_families") or []
-            _force_emulation_vmprotect = any("vmprotect" in str(p).lower() for p in packers)
+            for p in packers:
+                pl = str(p).lower()
+                if "vmprotect" in pl or "themida" in pl or "enigma" in pl or "obsidium" in pl:
+                    _force_emulation_advanced = True
+                    if any(x in pl for x in ADVANCED_PROTECTOR_EXTENDED_NAMES):
+                        _extended_protector_120 = True
+                    break
     BIN_GATE_ENABLE_EMULATION = os.getenv("BIN_GATE_ENABLE_EMULATION", "")
-    _emu_dbg(f"[emu_dbg] Attempting emulation for {path}, enabled={BIN_GATE_ENABLE_EMULATION}, opt(emulation)={opt('emulation', False)}, kind={kind}, skip_heavy={skip_heavy}, force_vmprotect={_force_emulation_vmprotect}")
-    # VMProtect: ignore skip_heavy and run emulation so CVE can use .dmp
-    if (opt("emulation", False) or _force_emulation_vmprotect) and kind == "PE" and (not skip_heavy or _force_emulation_vmprotect):
+    _emu_dbg(f"[emu_dbg] Attempting emulation for {path}, enabled={BIN_GATE_ENABLE_EMULATION}, opt(emulation)={opt('emulation', False)}, kind={kind}, skip_heavy={skip_heavy}, force_advanced={_force_emulation_advanced}, extended_120={_extended_protector_120}")
+    if not out.get("short_circuit_deny") and (opt("emulation", False) or _force_emulation_advanced) and kind == "PE" and (not skip_heavy or _force_emulation_advanced):
         t_emu = time.perf_counter()
-        _emu_dbg(f"[emu_dbg] Starting emulation for {path} (force_vmprotect={_force_emulation_vmprotect})")
+        _emu_dbg(f"[emu_dbg] Starting emulation for {path} (force_advanced={_force_emulation_advanced}, extended_120={_extended_protector_120})")
         try:
             from .emulation import run_emulation, merge_emulation_to_capa
             emu_timeout = int(opt("emulation_timeout", EMULATION_TIMEOUT))
             emu_max_mb = int(opt("emulation_max_mb", 50))
-            # VMProtect: ignore size limit so we always get a dump
-            if _force_emulation_vmprotect or emu_max_mb <= 0 or (file_size <= emu_max_mb * 1024 * 1024):
+            if _force_emulation_advanced or emu_max_mb <= 0 or (file_size <= emu_max_mb * 1024 * 1024):
                 emu_result = run_emulation(
                     path,
                     timeout=emu_timeout,
                     enable=True,
                     file_type="PE",
+                    complex_protector=_force_emulation_advanced,
+                    extended_protector=_extended_protector_120,
                 )
+                # Всегда сохраняем объект эмуляции (даже при пустых api_calls), чтобы репортер мог поставить [X]
                 if emu_result:
                     out["emulation"] = emu_result
-                    # Merge emulation results into capa techniques
+                # Merge emulation results into capa techniques
                     if out.get("capa"):
                         out["capa"] = merge_emulation_to_capa(emu_result, out["capa"])
                     # Push Speakeasy API interception results into supply_chain.dependencies
@@ -485,6 +615,8 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
                         out.setdefault("supply_chain", {}).setdefault("dependencies", []).extend(_emulation_deps)
         except Exception as e:
             errors.append(f"emulation_error:{e}")
+            # Возвращаем объект эмуляции даже при ошибке, чтобы репортер отметил этап как выполненный [X]
+            out["emulation"] = {"api_calls": [], "error": str(e), "techniques": []}
         emulation_sec = time.perf_counter() - t_emu
     
     # --- Threat Intelligence ---
@@ -520,7 +652,28 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
         except Exception as e:
             errors.append(f"ti_error:{e}")
         ti_sec = time.perf_counter() - t_ti
-    
+
+    # --- v3.2 Deep OSINT: извлечение IoC + обогащение (AbuseIPDB/Whois) ---
+    try:
+        from .osint_analyzer import analyze_osint
+        osint_result = analyze_osint(out, options)
+        if osint_result:
+            out["osint"] = osint_result
+    except Exception as e:
+        errors.append(f"osint_error:{e}")
+
+    # --- v3.2 Supply Chain Guard: hash matching OSS, typosquatting ---
+    try:
+        from .supply_chain_guard import analyze_supply_chain_guard
+        deps = (out.get("supply_chain") or {}).get("dependencies") or []
+        if deps:
+            guard_result = analyze_supply_chain_guard(deps)
+            out["supply_chain_guard"] = guard_result
+            if guard_result.get("tampering_suspected") and out.get("pe"):
+                out["pe"].setdefault("behavior_hints", {})["supply_chain_tampering"] = True
+    except Exception as e:
+        errors.append(f"supply_chain_guard_error:{e}")
+
     # --- Visual Analysis (PE icons) ---
     # Note: Icon extraction is already integrated into pe_hardening.py
     # We just need to populate the visual field from PE info if visual is enabled
@@ -533,19 +686,148 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
                 "icon_mismatch": False,
                 "masquerading_suspect": False,
             }
-            # Check for masquerading
+            # Check for masquerading (icon document + PE executable)
             icon_info = pe_info.get("icon") or {}
-            if icon_info.get("masquerading"):
+            if icon_info.get("masquerading") or icon_info.get("mismatch_detected"):
                 visual_data["icon_mismatch"] = True
                 visual_data["masquerading_suspect"] = True
-                visual_data["masquerading_details"] = icon_info.get("masquerading_details")
+                visual_data["masquerading"] = True
+                visual_data["masquerading_details"] = icon_info.get("masquerading_details") or icon_info.get("mismatch_type")
+                if "icon_masquerading" not in out["obfuscation"].get("reasons", []):
+                    out["obfuscation"]["reasons"] = list(set(out["obfuscation"].get("reasons", []) + ["icon_masquerading"]))
+                    out["obfuscation"]["score"] = min(100, int(out["obfuscation"].get("score", 0)) + 20)
+            # Жёсткая проверка: расширение документа (.xlsx, .docx, .pdf, .txt), а фактический тип — PE
+            doc_extensions = (".xlsx", ".docx", ".doc", ".xls", ".pptx", ".ppt", ".pdf", ".txt", ".docm", ".xlsm", ".pptm")
+            if kind == "PE" and sfx.lower() in doc_extensions and not visual_data.get("masquerading_suspect"):
+                visual_data["icon_mismatch"] = True
+                visual_data["masquerading_suspect"] = True
+                visual_data["masquerading"] = True
+                visual_data["masquerading_details"] = "document_extension_pe_executable"
                 if "icon_masquerading" not in out["obfuscation"].get("reasons", []):
                     out["obfuscation"]["reasons"] = list(set(out["obfuscation"].get("reasons", []) + ["icon_masquerading"]))
                     out["obfuscation"]["score"] = min(100, int(out["obfuscation"].get("score", 0)) + 20)
             out["visual"] = visual_data
+            # Для Masquerading 2.0 и Визуального аудита: явно задаём icon_type и file_type
+            if isinstance(visual_data, dict):
+                visual_data["icon_type"] = (icon_info.get("icon_type") or icon_info.get("mismatch_type") or "").strip() or "Unknown"
+                visual_data["file_type"] = "PE Executable" if kind == "PE" else (out.get("meta", {}).get("type") or "Unknown")
         except Exception as e:
             errors.append(f"visual_error:{e}")
-    
+
+    # --- Persistence Logic (автозагрузка: Run, RunOnce, Winlogon, Services, Task Scheduler) ---
+    try:
+        from .persistence_logic import analyze_persistence
+        persist_strings: List[str] = []
+        if out.get("strings") and out["strings"].get("static"):
+            persist_strings.extend(out["strings"]["static"][:1500])
+        if out.get("die") and out["die"].get("strings"):
+            persist_strings.extend(out["die"]["strings"][:500])
+        if out.get("emulation") and (out["emulation"].get("decoded_strings") or []):
+            persist_strings.extend(out["emulation"]["decoded_strings"][:300])
+        if persist_strings:
+            out["persistence_analysis"] = analyze_persistence(persist_strings)
+    except Exception as e:
+        errors.append(f"persistence_analysis_error:{e}")
+
+    # --- Network Profile (DoH / sneaky network) ---
+    try:
+        from .network_profile import analyze_network_profile
+        net_strings: List[str] = []
+        if out.get("strings") and out["strings"].get("static"):
+            net_strings.extend(out["strings"]["static"][:1500])
+        if out.get("die") and out["die"].get("strings"):
+            net_strings.extend(out["die"]["strings"][:500])
+        if out.get("emulation") and (out["emulation"].get("decoded_strings") or []):
+            net_strings.extend(out["emulation"]["decoded_strings"][:300])
+        if net_strings:
+            out["network_profile"] = analyze_network_profile(net_strings, ev=out)
+    except Exception as e:
+        errors.append(f"network_profile_error:{e}")
+
+    # --- verified_by_behavior: подтверждение persistence/network данными emulation ---
+    try:
+        emu = out.get("emulation")
+        if emu:
+            if out.get("persistence_analysis"):
+                from .persistence_logic import merge_persistence_with_emulation
+                out["persistence_analysis"] = merge_persistence_with_emulation(out["persistence_analysis"], emu)
+            if out.get("network_profile"):
+                from .network_profile import merge_network_with_emulation
+                out["network_profile"] = merge_network_with_emulation(out["network_profile"], emu)
+    except Exception as e:
+        errors.append(f"persistence_network_behavior_merge_error:{e}")
+
+    # --- Language (DIE/YARA + language_detector сигнатуры) и диспетчеризация AutoIt → ресурсы ---
+    try:
+        from .language_analyzer import infer_language
+        lang = infer_language(die_info=out.get("die"), yara_hits=out.get("yara"))
+        if lang:
+            out.setdefault("meta", {})["language"] = lang
+        if not out.get("meta", {}).get("language"):
+            from .language_detector import get_detection_and_route
+            head_data: Optional[bytes] = None
+            if out.get("binary_padding", {}).get("detected"):
+                try:
+                    from ..streaming_reader import read_head
+                    head_data = read_head(path, 512 * 1024)
+                except Exception:
+                    pass
+            det = get_detection_and_route(path=path, die_info=out.get("die"), yara_hits=out.get("yara"), data=head_data)
+            if det.get("language"):
+                out.setdefault("meta", {})["language"] = det["language"]
+            if det.get("route_autoit_resources"):
+                out.setdefault("meta", {})["route_autoit_resources"] = True
+            if det.get("route_jar_in_pe"):
+                out.setdefault("meta", {})["route_jar_in_pe"] = True
+                if det.get("jar_in_pe_offset") is not None:
+                    out.setdefault("meta", {})["jar_in_pe_offset"] = det["jar_in_pe_offset"]
+        else:
+            from .language_detector import should_scan_autoit_resources
+            if should_scan_autoit_resources(language=out["meta"].get("language")):
+                out.setdefault("meta", {})["route_autoit_resources"] = True
+        # Исключения Go/Rust: убрать из YARA хиты по рантайм-правилам (FP)
+        lang = out.get("meta", {}).get("language")
+        if lang and out.get("yara"):
+            from .language_rules import filter_yara_fp_by_language
+            out["yara"] = filter_yara_fp_by_language(out["yara"], lang)
+    except Exception as e:
+        errors.append(f"language_analyzer_error:{e}")
+
+    # --- PyInstaller overlay: извлечение имён упакованных файлов (pyinstaller_extractor) ---
+    try:
+        lang = (out.get("meta") or {}).get("language") or ""
+        has_pyi = "pyinstaller" in lang.lower() or "pyi" in lang.lower()
+        if not has_pyi and isinstance(out.get("yara"), list):
+            for h in out.get("yara") or []:
+                if "pyinstaller" in str(h.get("rule") or "").lower() or "pyi" in str(h.get("rule") or "").lower():
+                    has_pyi = True
+                    break
+        if has_pyi:
+            from .pyinstaller_extractor import extract_from_file
+            pyi_result = extract_from_file(path)
+            if pyi_result.get("has_pyi") or pyi_result.get("packed_names"):
+                out["pyinstaller_overlay"] = pyi_result
+    except Exception as e:
+        errors.append(f"pyinstaller_extractor_error:{e}")
+
+    # --- v2.0 Steganography (T1027.003): LSB в иконках/BMP; v3.0 расширенный JPEG/PNG/IAT ---
+    if kind == "PE":
+        try:
+            from .steganography import analyze_file_resources as analyze_steganography
+            stego_result = analyze_steganography(path)
+            if stego_result:
+                out["steganography"] = stego_result
+        except Exception as e:
+            errors.append(f"steganography_error:{e}")
+    try:
+        from .stego_detector import analyze_advanced as stego_advanced
+        adv = stego_advanced(path)
+        if adv.get("suspicious_media_metadata"):
+            out["suspicious_media_metadata"] = True
+            out.setdefault("steganography", {})["advanced"] = adv
+    except Exception as e:
+        errors.append(f"stego_detector_error:{e}")
+
     # --- Deep Script & Office Analysis ---
     if opt("deep_script", False) and sfx in (".doc", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".pdf", ".lnk", ".ps1", ".js", ".vbs", ".bat", ".cmd", ".sh"):
         try:
@@ -577,6 +859,31 @@ def run_one_file_analysis(path: Path, kind: str, options: Dict[str, Any]) -> Dic
             out["script_analysis"] = script_analysis
         except Exception as e:
             errors.append(f"deep_script_error:{e}")
+
+    # --- v3.0 Python bytecode: AST + опасные вызовы (eval/exec/os.system/subprocess) ---
+    if sfx == ".pyc":
+        try:
+            from .python_bytecode_analyzer import analyze_python_bytecode
+            pybc = analyze_python_bytecode(path)
+            out["python_bytecode"] = pybc
+            if pybc.get("script_eval_detected"):
+                out["script_eval_detected"] = True
+            if pybc.get("dynamic_assembly_detected") and pybc.get("technique_hints"):
+                th = out.get("technique_hints") or []
+                out["technique_hints"] = sorted(set(th + pybc["technique_hints"]))
+        except Exception as e:
+            errors.append(f"python_bytecode_error:{e}")
+
+    # --- v3.0 Lua bytecode: loadlib/ffi.load и загрузка динамических библиотек ---
+    if sfx in (".luac", ".lua"):
+        try:
+            from .lua_analyzer import analyze_lua_bytecode
+            lua_data = path.read_bytes() if path.exists() else None
+            if lua_data and (sfx == ".luac" or lua_data.startswith(b"\x1bLua")):
+                lua_res = analyze_lua_bytecode(path, lua_data)
+                out["lua_bytecode"] = lua_res
+        except Exception as e:
+            errors.append(f"lua_bytecode_error:{e}")
 
     wall_sec = time.perf_counter() - t0
     slowest = "capa" if capa_sec >= die_sec and capa_sec >= yara_sec else ("die" if die_sec >= yara_sec else "yara")

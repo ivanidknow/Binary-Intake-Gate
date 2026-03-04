@@ -5,6 +5,7 @@ import re
 # аккуратный маппинг из meta и имени правила → нормализованное название packer’a
 _FAMILY_HINTS = {
     "upx": "upx",
+    "upack": "upack",
     "vmprotect": "vmprotect",
     "themida": "themida",
     "mpress": "mpress",
@@ -19,9 +20,15 @@ _FAMILY_HINTS = {
     "obsidium": "obsidium",
     "dotfuscator": "dotfuscator",
     "confuser": "confuser",
+    "go-garble": "go_garble",
+    "go_garble": "go_garble",
+    "garble": "go_garble",
 }
 
-_NAME_RE = re.compile(r"(upx|vmprotect|themida|mpress|aspack|enigma|petite|fsg|molebox|yoda|telock|pecompact|obsidium|dotfuscator|confuser)", re.I)
+_NAME_RE = re.compile(
+    r"(upx|upack|vmprotect|themida|mpress|aspack|enigma|petite|fsg|molebox|yoda|telock|pecompact|obsidium|dotfuscator|confuser|go[-_]?garble|garble)",
+    re.I,
+)
 
 def detect_packers_from_yara(yara_hits: List[Dict]) -> List[str]:
     families = set()

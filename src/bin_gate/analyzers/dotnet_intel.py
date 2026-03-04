@@ -23,7 +23,7 @@ import json
 KNOWN_OBFUSCATORS = {
     "ConfuserEx": [b"ConfuserEx", b"Confuser.Core"],
     "Dotfuscator": [b"Dotfuscator", b"PreEmptive"],
-    "SmartAssembly": [b"SmartAssembly", b"{SmartAssembly}"],
+    "SmartAssembly": [b"SmartAssembly", b"{SmartAssembly}", b"SmartAssembly.Resource", b"Red Gate", b"SmartAssembly.Attribute", b"SmartAssembly.StringEncoding"],
     "Eazfuscator": [b"Eazfuscator", b"EazObfuscator"],
     ".NET Reactor": [b".NET Reactor", b"Eziriz", b"__reactor__"],
     "Agile.NET": [b"Agile.NET", b"CliSecure"],
@@ -40,6 +40,9 @@ KNOWN_OBFUSCATORS = {
     "Skater.NET": [b"Skater.NET"],
     "NETGuard": [b"NETGuard", b"netguard"],
     "Obfuscar": [b"Obfuscar"],
+    # v2.0 APT: Boxed App (virtualization/packer), Eazfuscator (already listed above; ensure coverage)
+    "Boxed App": [b"BoxedApp", b"BoxedAppPacker", b"BxILMerge", b"BoxedApp.SDK"],
+    "Eazfuscator": [b"Eazfuscator", b"EazObfuscator", b"Eazfuscator.NET"],  # explicit v2.0
 }
 
 # Suspicious .NET section names (common with packers/protectors)

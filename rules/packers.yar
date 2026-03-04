@@ -147,9 +147,11 @@ rule PACKER_FSG_Generic
     author  = "bin-gate"
     family  = "fsg"
     category= "packer"
+    mitre   = "T1027"
   strings:
     $f1 = "FSG!" ascii
     $f2 = ".FSG" ascii nocase
+    $f3 = "FSG" ascii
   condition:
     any of them
 }
@@ -270,10 +272,12 @@ rule PACKER_Petite_Generic
     author  = "bin-gate"
     family  = "petite"
     category= "packer"
+    mitre   = "T1027"
   strings:
     $p1 = "Petite" ascii nocase
+    $p2 = ".petite" ascii nocase
   condition:
-    $p1
+    $p1 or $p2
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -311,7 +315,7 @@ rule PACKER_Armadillo_Generic
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// UPack
+// UPack (Legacy: может иметь нулевые размеры секций в заголовке)
 ///////////////////////////////////////////////////////////////////////////////
 
 rule PACKER_UPack_Generic
@@ -320,10 +324,13 @@ rule PACKER_UPack_Generic
     author  = "bin-gate"
     family  = "upack"
     category= "packer"
+    mitre   = "T1027"
   strings:
     $u1 = "UPack" ascii nocase
+    $u2 = ".Upack" ascii nocase
+    $u3 = "UPX0" ascii
   condition:
-    $u1
+    $u1 or $u2 or $u3
 }
 
 ///////////////////////////////////////////////////////////////////////////////

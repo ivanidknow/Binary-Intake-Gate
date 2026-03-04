@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import re
 import ast
 
@@ -142,18 +142,20 @@ def _derive_ctx(ev: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- v0.0.8 Advanced Malware Detection ---
     
-    # Emulation results
+    # Emulation results (подтехники и techniques — безопасный пустой список при отсутствии)
     emu = ev.get("emulation")
     if isinstance(emu, dict):
+        _emu_tech = emu.get("techniques")
+        techniques_list = list(_emu_tech) if isinstance(_emu_tech, list) else []
         ctx["emulation"] = {
             "enabled": bool(emu.get("enabled")),
             "success": bool(emu.get("success")),
-            "api_calls": emu.get("api_calls", []),
-            "api_count": len(emu.get("api_calls", [])),
-            "api_summary": emu.get("api_summary", {}),
-            "mutexes": emu.get("mutexes", []),
-            "mutex_count": len(emu.get("mutexes", [])),
-            "techniques": emu.get("techniques", []),
+            "api_calls": list(emu.get("api_calls") or []),
+            "api_count": len(emu.get("api_calls") or []),
+            "api_summary": emu.get("api_summary") if isinstance(emu.get("api_summary"), dict) else {},
+            "mutexes": list(emu.get("mutexes") or []),
+            "mutex_count": len(emu.get("mutexes") or []),
+            "techniques": techniques_list,
             "files_created": len(emu.get("files", {}).get("created", [])),
             "files_written": len(emu.get("files", {}).get("written", [])),
             "registry_ops": len(emu.get("registry", [])),
@@ -192,24 +194,23 @@ def _derive_ctx(ev: Dict[str, Any]) -> Dict[str, Any]:
         }
         ctx["ti"] = ctx["threat_intel"]
     
-    # Visual analysis (PE icon, resource entropy)
+    # Visual analysis (PE icon, resource entropy). Устойчиво к None для LNK/скриптов (нет PE-метаданных).
     vis = ev.get("visual")
     if isinstance(vis, dict):
-        icon = vis.get("icon", {})
-        res_ent = vis.get("resource_entropy", {})
+        icon = vis.get("icon") if isinstance(vis.get("icon"), dict) else {}
+        res_ent = vis.get("resource_entropy") if isinstance(vis.get("resource_entropy"), dict) else {}
         ctx["visual"] = {
-            "icon_present": bool(icon.get("present")),
-            "icon_mismatch": bool(icon.get("mismatch_detected")),
-            "icon_mismatch_type": icon.get("mismatch_type"),
-            "resource_suspicious": bool(res_ent.get("suspicious")),
-            "max_resource_entropy": res_ent.get("max_resource_entropy", 0.0),
+            "icon_present": bool(icon.get("present") if icon is not None else False),
+            "icon_mismatch": bool(icon.get("mismatch_detected") if icon else False),
+            "icon_mismatch_type": icon.get("mismatch_type") if icon else None,
+            "resource_suspicious": bool(res_ent.get("suspicious") if res_ent else False),
+            "max_resource_entropy": float(res_ent.get("max_resource_entropy", 0.0) or 0.0) if res_ent else 0.0,
         }
     else:
         ctx["visual"] = {
             "icon_present": False, "icon_mismatch": False, "icon_mismatch_type": None,
             "resource_suspicious": False, "max_resource_entropy": 0.0,
         }
-    
     # Script/Office analysis
     scr = ev.get("script_analysis")
     if isinstance(scr, dict):
@@ -313,7 +314,27 @@ def _check_critical_errors(ev: Dict[str, Any]) -> List[str]:
     return found_critical
 
 
-def evaluate_policy(ev: Dict[str, Any], policy: Dict[str, Any], profile: str = "dev") -> Dict[str, Any]:
+def get_evidence_identity(ev: Dict[str, Any]) -> Optional[str]:
+    """Identity для дифференциального скоринга: InternalName или OriginalFilename (тот же продукт, другая версия/хеш)."""
+    pe = ev.get("pe") or {}
+    if not isinstance(pe, dict):
+        return None
+    res = pe.get("resources") or {}
+    ver = res.get("version") if isinstance(res, dict) else {}
+    if isinstance(ver, dict):
+        for key in ("InternalName", "OriginalFilename", "ProductName"):
+            val = ver.get(key)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def evaluate_policy(
+    ev: Dict[str, Any],
+    policy: Dict[str, Any],
+    profile: str = "dev",
+    historical_risk_score: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Возвращает:
       {
@@ -421,10 +442,85 @@ def evaluate_policy(ev: Dict[str, Any], policy: Dict[str, Any], profile: str = "
             reasons.append("[vmprotect] Protector: VMProtect detected — WARN (dev)")
             total_score += 50
 
-    return {
+    # Risk-based scoring (0–100): Hardening +10, CWE +30, DGA +50, No signature +20/+50 (PROD), High entropy +25
+    risk_score = 0
+    critical_risk_jump = False
+    try:
+        from ..scoring import (
+            compute_risk_score,
+            build_deny_justification,
+            build_risk_summary,
+            get_risk_reason_strings,
+            get_risk_mitre_techniques,
+            get_mitre_from_reasons,
+            is_high_entropy_obfuscated,
+            check_differential_risk,
+            RISK_REVOKED_CERTIFICATE,
+        )
+        risk_score = compute_risk_score(ev, profile=profile)
+        reasons.extend(get_risk_reason_strings(ev, profile))
+        # MITRE ID: из evidence (get_risk_mitre_techniques) + из scoring_reasons (REASON_TO_MITRE_MAP)
+        mitre_ids = list(dict.fromkeys(
+            get_risk_mitre_techniques(ev, profile) + get_mitre_from_reasons(reasons)
+        ))
+        if mitre_ids:
+            highlights = ev.get("highlights")
+            if not isinstance(highlights, dict):
+                ev["highlights"] = {}
+                highlights = ev["highlights"]
+            existing = list(highlights.get("mitre_techniques") or [])
+            highlights["mitre_techniques"] = list(dict.fromkeys(existing + mitre_ids))
+        total_score = max(total_score, risk_score)
+        # RISK_REVOKED_CERTIFICATE (100) принудительно deny во всех профилях
+        if risk_score >= RISK_REVOKED_CERTIFICATE:
+            decision = "deny"
+        elif hard_effect == "deny" or total_score >= int(thr["deny"]):
+            decision = "deny"
+        elif total_score >= int(thr["warn"]):
+            decision = "warn"
+        if historical_risk_score is not None and check_differential_risk(risk_score, historical_risk_score):
+            critical_risk_jump = True
+            reasons.append("[differential] Резкий рост риска относительно предыдущей версии — требуется Manual Review")
+            if decision == "allow":
+                decision = "warn"
+                total_score = max(total_score, 60)
+        if is_high_entropy_obfuscated(ev) and decision == "allow":
+            decision = "warn"
+            reasons.append("[entropy] High Risk: Obfuscated (entropy > 7.2) — требуется ручная проверка (manual review)")
+            total_score = max(total_score, 50)
+    except Exception:
+        pass
+
+    result = {
         "decision": decision,
         "score": int(total_score),
         "reasons": reasons,
         "matched": matched_ids,
         "critical_errors": critical_errors,
+        "risk_score": risk_score,
+        "critical_risk_jump": critical_risk_jump,
     }
+    # Justification: все scoring_reasons должны попадать в итоговую строку, не затираясь
+    if risk_score > 0:
+        try:
+            from ..scoring import build_risk_summary
+            summary = build_risk_summary(ev, profile)
+            reasons_str = "; ".join(str(r) for r in reasons[:15]) if reasons else ""
+            result["justification"] = summary + (" Причины: " + reasons_str if reasons_str else "")
+            # При вердикте ALLOW/WARN обоснование не должно начинаться с «Заблокировано:»
+            if result["decision"] != "deny" and (result.get("justification") or "").strip().startswith("Заблокировано:"):
+                rest = (result["justification"] or "").replace("Заблокировано:", "", 1).strip()
+                result["justification"] = "Риск: " + (rest if rest else str(risk_score))
+        except Exception:
+            result["justification"] = f"Риск: {risk_score}. Проверьте reasons."
+    if result["decision"] == "deny":
+        try:
+            from ..scoring import build_deny_justification
+            deny_just = build_deny_justification(ev, result)
+            if deny_just:
+                result["justification"] = deny_just
+            elif reasons:
+                result["justification"] = "Заблокировано: " + "; ".join(str(r) for r in reasons[:15]) + "."
+        except Exception:
+            result["justification"] = "Заблокировано по результатам анализа."
+    return result
