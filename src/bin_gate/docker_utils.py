@@ -535,9 +535,10 @@ def _cwe_safe_result(error: str, return_code: int, stderr: str) -> Dict[str, Any
 def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     """
     Run cwe_checker (fkiecad/cwe_checker) in Docker on the given binary/dump file.
-    Mounts parent folder as /share:ro; command: cwe_checker /share/<name> --core --json (fallback --no-config).
+    Mounts parent folder as /share:ro; command: cwe_checker /share/<filename> --json.
+    If container requires config/ghidra, retry with --statistics --json (lighter analysis for packed files).
     Returns dict with keys: findings (list), error (str or None), return_code (int), stderr (str).
-    Временный файл не создаётся; host_path выставляется в 0o644 для доступа контейнера (FINAL MANDATORY CWE STAGE).
+    host_path выставляется в 0o644 для доступа контейнера (FINAL MANDATORY CWE STAGE).
     """
     import json as _json
     debug = debug or (os.environ.get("BIN_GATE_CWE_DEBUG", "").strip().lower() in ("1", "true", "yes"))
@@ -550,30 +551,31 @@ def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     except OSError:
         pass
     host_dir = host_path.parent
+    # Первый аргумент — путь к бинарнику в контейнере /share/<filename>; затем --json (без --no-config)
     container_file = f"/share/{host_path.name}"
     mount_arg = f"{host_dir}:/share:ro"
-    result = None
-    stdout_str = ""
-    stderr_str = ""
-    for extra_args in (["--core", "--json"], ["--no-config", "--json"]):
-        cmd = ["docker", "run", "--rm", "--user", "root", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file] + list(extra_args)
+    cmd = ["docker", "run", "--rm", "--user", "root", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file, "--json"]
+    if debug:
+        print(f"[DOCKER_CWE_DEBUG] cmd: {cmd}", flush=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return _cwe_safe_result("timeout_300s", -1, "")
+    except Exception as e:
+        return _cwe_safe_result(str(e), -1, "")
+    stdout_str = (result.stdout or "").strip()
+    stderr_str = (result.stderr or "").strip()
+    # Если контейнер требует конфиг/тяжёлый анализ — повтор с --statistics (проверка без Ghidra на упакованных файлах)
+    if result.returncode != 0 and any(x in (stderr_str + stdout_str).lower() for x in ("config", "ghidra", "mandatory")):
+        cmd_stat = cmd[:-1] + ["--statistics", "--json"]
         if debug:
-            print(f"[DOCKER_CWE_DEBUG] cmd: {cmd}", flush=True)
+            print(f"[DOCKER_CWE_DEBUG] retry with --statistics: {cmd_stat}", flush=True)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            return _cwe_safe_result("timeout_300s", -1, "")
-        except Exception as e:
-            return _cwe_safe_result(str(e), -1, "")
-        stdout_str = (result.stdout or "").strip()
-        stderr_str = (result.stderr or "").strip()
-        if result.returncode == 0:
-            break
-        if any(x in (stderr_str + stdout_str).lower() for x in ("config", "ghidra", "json", "mandatory")):
-            continue
-        break
-    if result is None:
-        return _cwe_safe_result("CWE Analysis unavailable", -1, "")
+            result = subprocess.run(cmd_stat, capture_output=True, text=True, timeout=300)
+            stdout_str = (result.stdout or "").strip()
+            stderr_str = (result.stderr or "").strip()
+        except Exception:
+            pass
     if debug or result.returncode != 0:
         print(f"[DOCKER_CWE] returncode={result.returncode} stdout_len={len(stdout_str)} stderr_len={len(stderr_str)}", flush=True)
         if debug and stdout_str:

@@ -558,6 +558,43 @@ def _dump_emulated_memory_to_file(se: Any, source_path: Path) -> Optional[str]:
     return None
 
 
+def _add_mem_invalid_hook(se: Any) -> None:
+    """
+    Регистрирует обработчик неразмеченной памяти через se.add_mem_invalid_hook (если API есть).
+    При UC_MEM_WRITE_UNMAPPED вызывается se.mem_map(address & ~0xfff, 0x1000), возврат True — выполнение продолжается.
+    """
+    PAGE_SIZE = 0x1000
+
+    def _hook_mem_invalid(*args: Any) -> bool:
+        # API может вызывать (address, size, access) или (emu, address, size, access)
+        address = args[0] if args else 0
+        if not isinstance(address, int) and len(args) >= 2:
+            address = args[1]
+        base = int(address) & ~0xFFF
+        try:
+            mem_map = getattr(se, "mem_map", None)
+            if callable(mem_map):
+                mem_map(base, PAGE_SIZE)
+        except Exception:
+            pass
+        try:
+            uc = getattr(se, "emu", None) or getattr(se, "_emu", None) or getattr(se, "uc", None)
+            if uc is None and callable(getattr(se, "get_emu", None)):
+                uc = se.get_emu()
+            if uc is not None:
+                uc.mem_map(base, PAGE_SIZE)
+        except Exception:
+            pass
+        return True
+
+    try:
+        add_hook = getattr(se, "add_mem_invalid_hook", None)
+        if callable(add_hook):
+            add_hook(_hook_mem_invalid)
+    except Exception:
+        pass
+
+
 def _install_unmapped_write_hook(se: Any) -> None:
     """
     Хук на ошибку записи/чтения неразмеченной памяти (UC_ERR_WRITE_UNMAPPED): при записи в неразмеченную
@@ -652,7 +689,10 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
                 se = Speakeasy(config=config_legacy)
             except TypeError:
                 se = Speakeasy()
-        
+
+        # Обработчик неразмеченной памяти: при UC_MEM_WRITE_UNMAPPED мапим страницу 4КБ, продолжаем выполнение (дамп создаётся)
+        _add_mem_invalid_hook(se)
+
         # Load the module (критический сбой загрузчика UC_ERR_WRITE_UNMAPPED и др. — не роняем весь процесс)
         try:
             module = se.load_module(str(path))
