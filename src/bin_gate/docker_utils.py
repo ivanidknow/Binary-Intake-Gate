@@ -526,31 +526,43 @@ def run_emulation_container(
         )
 
 
-def run_cwe_checker(file_path: Path) -> Dict[str, Any]:
+def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     """
     Run cwe_checker (fkiecad/cwe_checker) in Docker on the given binary/dump file.
     Mounts parent folder as /share:ro; command: cwe_checker /share/<name> --json.
     Returns dict with keys: findings (list), error (str or None), return_code (int), stderr (str).
+    When debug=True (или BIN_GATE_CWE_DEBUG=1), логирует stdout/stderr контейнера в консоль.
     """
     import json as _json
-    host_path = Path(file_path)
+    debug = debug or (os.environ.get("BIN_GATE_CWE_DEBUG", "").strip().lower() in ("1", "true", "yes"))
+    host_path = Path(file_path).resolve()
     if not host_path.exists():
         return {"findings": [], "error": "file_not_found", "return_code": -1, "stderr": ""}
-    host_dir = host_path.parent.resolve()
-    container_file = f"/share/{file_path.name}"
-    cmd = ["docker", "run", "--rm", "-v", f"{host_dir}:/share:ro", CWE_CHECKER_IMAGE, container_file, "--json"]
+    host_dir = host_path.parent
+    # Монтируем родительский каталог в /share:ro, чтобы контейнер видел файл как /share/<name>
+    container_file = f"/share/{host_path.name}"
+    mount_arg = f"{host_dir}:/share:ro"
+    cmd = ["docker", "run", "--rm", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file, "--json"]
+    if debug:
+        print(f"[DOCKER_CWE_DEBUG] cmd: {cmd}", flush=True)
+        print(f"[DOCKER_CWE_DEBUG] host_path={host_path!r} mount={mount_arg!r} container_file={container_file!r}", flush=True)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
         return {"findings": [], "error": "timeout_300s", "return_code": -1, "stderr": ""}
     except Exception as e:
         return {"findings": [], "error": str(e), "return_code": -1, "stderr": ""}
-    if result.returncode != 0:
-        print(f"[DOCKER_ERROR] cwe_checker failed: {result.stderr}", flush=True)
-    import re as _re
     stdout_str = (result.stdout or "").strip()
     stderr_str = (result.stderr or "").strip()
-    print(f"[DOCKER_CWE] Raw stdout length: {len(stdout_str)}", flush=True)
+    if debug or result.returncode != 0:
+        print(f"[DOCKER_CWE] returncode={result.returncode} stdout_len={len(stdout_str)} stderr_len={len(stderr_str)}", flush=True)
+        if debug:
+            print(f"[DOCKER_CWE_DEBUG] stdout:\n{stdout_str[:4000] or '(empty)'}", flush=True)
+            print(f"[DOCKER_CWE_DEBUG] stderr:\n{stderr_str[:2000] or '(empty)'}", flush=True)
+        elif result.returncode != 0 and stderr_str:
+            print(f"[DOCKER_CWE] stderr: {stderr_str[:800]}", flush=True)
+    if result.returncode != 0:
+        print(f"[DOCKER_ERROR] cwe_checker failed: {stderr_str[:500]}", flush=True)
     findings: List[Dict[str, Any]] = []
     match = _re.search(r"\[\s*\{.*\}\s*\]", result.stdout or "", _re.DOTALL)
     if match:

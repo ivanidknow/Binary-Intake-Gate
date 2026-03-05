@@ -659,7 +659,6 @@ def run_parallel_scan(
             continue
         try:
             from .analyzers.yara_scan import run_yara
-            from .docker_utils import run_cwe_checker
             dump_p = Path(dump_path)
             yara_hits = run_yara(
                 dump_p,
@@ -796,27 +795,32 @@ def run_parallel_scan(
                 except Exception:
                     pass
 
-    # CWE STAGE — реальный запуск контейнера анализатора CWE (поиск логических уязвимостей); результат в ev["cwe_analysis"] для чек-листа
+    # FINAL MANDATORY CWE STAGE — после завершения всех воркеров: вызов run_cwe_checker для каждого evidence, результат в ev["cwe_analysis"]
+    print("[DEBUG] Total evidences to process for CWE: {}".format(len(evidences)), flush=True)
     print("\n" + "=" * 40, flush=True)
-    print("!!! CWE STAGE (cwe_checker) !!!", flush=True)
+    print("!!! FINAL MANDATORY CWE STAGE START !!!", flush=True)
     print("=" * 40, flush=True)
-    from .docker_utils import run_cwe_checker
-    cwe_run_count = 0
-    for ev in evidences:
-        target_path = ev.get("path") or (ev.get("meta") or {}).get("path") or ""
-        if not target_path:
-            continue
-        target = Path(target_path)
-        if not target.exists():
-            ev["cwe_analysis"] = {"findings": [], "error": "file_not_found", "return_code": -1}
-            continue
-        _thread_safe_log(f"[cwe] Starting scan for {target.name}")
-        _thread_safe_log(f"[cwe] Вызов контейнера для поиска логических уязвимостей: {target.name}")
-        print(f"[CWE_CHECK] {target.name}", flush=True)
-        ev["cwe_analysis"] = run_cwe_checker(target)
-        cwe_run_count += 1
-    if cwe_run_count > 0:
-        _thread_safe_log(f"[cwe] Запущено проверок: {cwe_run_count}")
+    _thread_safe_log("!!! FINAL MANDATORY CWE STAGE START !!!")
+    docker_ok = check_docker_available(raise_on_fail=False)
+    if not docker_ok.available:
+        _thread_safe_log("[cwe] Docker недоступен, этап CWE пропущен")
+    else:
+        cwe_run_count = 0
+        for ev in evidences:
+            target_path = (ev.get("meta") or {}).get("path") or ev.get("path") or ""
+            if not target_path:
+                continue
+            target = Path(target_path)
+            if not target.exists():
+                ev["cwe_analysis"] = {"findings": [], "error": "file_not_found", "return_code": -1}
+                continue
+            _thread_safe_log(f"[cwe] Starting scan for {target.name}")
+            _thread_safe_log(f"[cwe] Вызов контейнера docker cwe_checker: {target.name}")
+            print(f"[CWE_CHECK] {target.name}", flush=True)
+            ev["cwe_analysis"] = run_cwe_checker(target)
+            cwe_run_count += 1
+        if cwe_run_count > 0:
+            _thread_safe_log(f"[cwe] Запущено проверок: {cwe_run_count}")
 
     # v3.1: граф атаки (Staged Execution) для отчёта
     try:

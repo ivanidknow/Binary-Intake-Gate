@@ -60,7 +60,20 @@ $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
 if (-not $dockerCmd) {
     Write-Host "Пропуск: Docker не найден в PATH. Образ эмуляции не собран." -ForegroundColor Yellow
 } else {
-    python -m bin_gate.cli emulation-build 2>&1
+    # Тот же Python, что для pip (где установлен bin_gate); PYTHONPATH на случай другого интерпретатора
+    $env:PYTHONPATH = Join-Path $root "src"
+    $pythonExe = $null
+    $pipExe = Get-Command pip -ErrorAction SilentlyContinue
+    if ($pipExe) {
+        $pipDir = Split-Path $pipExe.Source -Parent
+        $pythonExe = Join-Path (Split-Path $pipDir -Parent) "python.exe"
+        if (-not (Test-Path $pythonExe)) { $pythonExe = $null }
+    }
+    if ($pythonExe) {
+        & $pythonExe -m bin_gate.cli emulation-build 2>&1
+    } else {
+        bin-gate emulation-build 2>&1
+    }
     if ($LASTEXITCODE -eq 0) {
         $componentsOk.Docker = $true
         Write-Host "OK: Docker-образ эмуляции успешно собран." -ForegroundColor Green

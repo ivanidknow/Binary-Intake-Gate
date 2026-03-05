@@ -753,6 +753,7 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
 
         info["imports"] = sorted(red_imps)              # совместимость
         info["imports_count"] = imp_count
+        info["imports_all_names"] = sorted(set(nm for _, nm in imports_list))  # все имена для technique_hints (ShowWindow и т.д.)
         info["imported_dlls"] = sorted(set(dlls))
         info["ordinal_imports"] = ordinal_imports
         info["dangerous_ordinal_imports"] = dangerous_ordinal_imports
@@ -958,8 +959,12 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
                 technique_hints.append("T1543.003")
             if any("rtldecompressbuffer" in x for x in all_low) or (any("xor" in x for x in all_low) and any("decode" in x for x in all_low)):
                 technique_hints.append("T1140")
-            # 10 techniques: UAC Bypass, Modify Registry, File Deletion, etc.
-            if any("fodhelper" in x or "eventvwr" in x for x in all_low) and any("regsetvalueex" in x or "ms-settings" in x for x in all_low):
+            # T1548.002 — UAC Bypass: fodhelper, eventvwr, ComputerDefaults; registry path Software\Classes\ms-settings\Shell\Open\command
+            if any("fodhelper" in x or "eventvwr" in x or "computerdefaults" in x for x in all_low) and any("regsetvalueex" in x or "ms-settings" in x or "regcreatekeyex" in x for x in all_low):
+                technique_hints.append("T1548.002")
+            if any("ms-settings" in x and ("shell" in x or "open" in x) and "command" in x for x in all_low):
+                technique_hints.append("T1548.002")
+            if any("software\\classes" in x or "software/classes" in x for x in all_low) and any("ms-settings" in x for x in all_low):
                 technique_hints.append("T1548.002")
             if any("disableantispyware" in x for x in all_low) or any(("windows defender" in x and "policies" in x) for x in all_low):
                 technique_hints.append("T1112")
@@ -1013,7 +1018,17 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
                 technique_hints.append("T1112")
             if any("setfileattributes" in x for x in all_low) and any("file_attribute_hidden" in x or "0x02" in x for x in all_low):
                 technique_hints.append("T1564.001")
+            # T1564.003 — Hidden Window: SW_HIDE (0), STARTF_USESHOWWINDOW, CREATE_NO_WINDOW (0x08000000); ShowWindow from user32
             if any("create_no_window" in x or "sw_hide" in x for x in all_low):
+                technique_hints.append("T1564.003")
+            if any("0x08000000" in x for x in all_low):
+                technique_hints.append("T1564.003")
+            if any("startf_useshowwindow" in x or "useshowwindow" in x for x in all_low):
+                technique_hints.append("T1564.003")
+            if any("showwindow" in x for x in all_low) and any("sw_hide" in x or "0x00" in x or " 0)" in x or "create_no_window" in x for x in all_low):
+                technique_hints.append("T1564.003")
+            imp_names = (info.get("imports_all_names") or [])
+            if any(n and str(n).strip().lower() == "showwindow" for n in imp_names):
                 technique_hints.append("T1564.003")
             if any("pcalua" in x or "conhost" in x for x in all_low):
                 technique_hints.append("T1202")
@@ -1053,7 +1068,12 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
                 technique_hints.append("T1137")
             if any("scrnsave.exe" in x for x in all_low) and any("control panel" in x or "desktop" in x for x in all_low):
                 technique_hints.append("T1546.002")
-            if any("1337" in x or "4444" in x or "666" in x for x in all_low) and any("connect" in x or "wsaconnect" in x for x in all_low):
+            # T1048.003 — Uncommon Port: ws2_32 (socket/connect) + port 1337 or Winsock usage
+            if any("1337" in x or "4444" in x or "666" in x for x in all_low) and any("connect" in x or "wsaconnect" in x or "socket" in x for x in all_low):
+                technique_hints.append("T1048.003")
+            if any("ws2_32" in x or "winsock" in x for x in all_low) and any("connect" in x or "socket" in x for x in all_low) and any("1337" in x for x in all_low):
+                technique_hints.append("T1048.003")
+            if any("ws2_32" in x or "winsock" in x for x in all_low) and any("connect" in x or "socket" in x for x in all_low):
                 technique_hints.append("T1048.003")
             if any(("hosts" in x and ("etc" in x or "drivers" in x)) or "definition.microsoft" in x or "update.microsoft" in x for x in all_low):
                 technique_hints.append("T1562.006")
@@ -1066,9 +1086,17 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
             if any("systemparametersinfo" in x or "spi_setdeskwallpaper" in x for x in all_low):
                 technique_hints.append("T1491")
             # Top-20 sub-techniques
+            # T1546.003 — WMI Event Subscription: ROOT\CIMV2, CommandLineEventConsumer, ActiveScriptEventConsumer
             if any("__eventfilter" in x or "commandlineeventconsumer" in x for x in all_low) and any("iwbemservices" in x or "putinstance" in x for x in all_low):
                 technique_hints.append("T1546.003")
+            if any("root\\cimv2" in x or "root/cimv2" in x or "commandlineeventconsumer" in x or "activescripteventconsumer" in x for x in all_low):
+                technique_hints.append("T1546.003")
+            # T1547.009 — Shortcut Mod: IShellLink, .lnk with IPersistFile or Start Menu path
             if any("start menu" in x for x in all_low) and any("shelllink" in x or "ipersistfile" in x for x in all_low) and any(".lnk" in x for x in all_low):
+                technique_hints.append("T1547.009")
+            if any("ishelllink" in x or "ipersistfile" in x for x in all_low) and any(".lnk" in x for x in all_low):
+                technique_hints.append("T1547.009")
+            if any("start menu" in x and "startup" in x for x in all_low):
                 technique_hints.append("T1547.009")
             if any("netsh" in x for x in all_low) and any("add helper" in x or "inetcfg" in x for x in all_low):
                 technique_hints.append("T1546.007")
@@ -1092,7 +1120,10 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
                 technique_hints.append("T1056.001")
             if any("iex" in x or "frombase64string" in x for x in all_low) and any("powershell" in x or "-enc" in x for x in all_low):
                 technique_hints.append("T1059.001")
+            # T1059.003 — CMD: WinExec or CreateProcess with cmd.exe /c
             if any("cmd.exe" in x for x in all_low) and any(" && " in x or " || " in x for x in all_low):
+                technique_hints.append("T1059.003")
+            if any("winexec" in x or "createprocess" in x for x in all_low) and any("cmd.exe" in x for x in all_low) and any("/c" in x or " /c " in x or "\\c " in x for x in all_low):
                 technique_hints.append("T1059.003")
             if any("wmic" in x for x in all_low) and any("cpu get name" in x or "os get caption" in x for x in all_low):
                 technique_hints.append("T1082")
@@ -1107,9 +1138,15 @@ def analyze_pe_hardening(path: Path) -> Dict[str, Any]:
             # v0.1.9: 10 новых техник Credentials & Impact
             if any("lsass" in x for x in all_low) and any("minidumpwritedump" in x for x in all_low) and any("openprocess" in x or "process32first" in x for x in all_low):
                 technique_hints.append("T1003.001")
-            if any("password=" in x or "login=" in x or "apikey=" in x for x in all_low) and any(".env" in x or ".config" in x or ".xml" in x for x in all_low):
+            # T1552.001 — Credentials in Files: .env, config.ini, credentials, password=, apikey=
+            if any("password=" in x or "login=" in x or "apikey=" in x for x in all_low) and any(".env" in x or ".config" in x or "config.ini" in x or ".xml" in x for x in all_low):
                 technique_hints.append("T1552.001")
+            if any(".env" in x or "config.ini" in x for x in all_low) and any("findfirstfile" in x or "findnextfile" in x or "openfile" in x or "createfile" in x for x in all_low):
+                technique_hints.append("T1552.001")
+            # T1003.002 — OS Credential Dumping: SAM, SYSTEM, SECURITY (registry / RegSaveKey)
             if any("regsavekey" in x or "reg.exe save" in x for x in all_low) and any("sam" in x or "system" in x or "security" in x for x in all_low):
+                technique_hints.append("T1003.002")
+            if any("regopenkey" in x or "regopenkeyex" in x for x in all_low) and any("sam" in x or "system" in x or "security" in x for x in all_low):
                 technique_hints.append("T1003.002")
             if any("controlservice" in x for x in all_low) and any("openservice" in x or "openscmanager" in x for x in all_low) and any("eventlog" in x or "windefend" in x for x in all_low):
                 technique_hints.append("T1489")

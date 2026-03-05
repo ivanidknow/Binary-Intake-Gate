@@ -12,9 +12,9 @@ test-security:
 	pytest tests/test_methodology.py -v --tb=short
 	$(MAKE) clean-artifacts
 
-# Только сгенерировать артефакты (для отладки)
+# Только сгенерировать артефакты. Legacy overlay всегда; при наличии gcc/mingw добавляется Payload-as-Code (цель 250+).
 artifacts:
-	python -c "import sys; from pathlib import Path; sys.path.insert(0, '.'); exec(open('tests/artifact_factory.py').read()); paths = build_all(Path('$(TEST_ARTIFACTS_DIR)')); print('Artifacts:', list(paths.items()))"
+	python -c "import sys; from pathlib import Path; sys.path.insert(0, 'tests'); from artifact_factory import build_all; paths = build_all(Path('$(TEST_ARTIFACTS_DIR)')); n=len(paths); print(n, 'artifacts'); print('250+ target:', 'OK' if n>=250 else 'Need gcc/mingw for Payload-as-Code to reach 250+')"
 	@echo "Artifacts written to $(TEST_ARTIFACTS_DIR)"
 
 # Удаление сгенерированных тестовых артефактов

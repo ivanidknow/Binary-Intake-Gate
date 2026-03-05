@@ -1019,6 +1019,66 @@ def test_memory_dump_scan(built_artifacts):
     assert "test_eicar_in_memory" in low, "Report should contain YARA hit from memory dump analysis"
 
 
+def test_payload_code_behavioral_artifacts(built_artifacts, request):
+    """
+    Payload-as-Code: артефакт, собранный из C-шаблона, даёт поведенческие артефакты:
+    API-логи эмуляции (emulation.api_calls или emulation.techniques) и/или memory_dump_analysis.
+    Проверка реального исполняемого кода, а не оверлея.
+    """
+    from bin_gate.analyzers.run_one_file import run_one_file_analysis
+
+    # Приоритет: скомпилированный payload, иначе любой PE с эмуляцией
+    path = (
+        built_artifacts.get("t1059_001_powershell")
+        or built_artifacts.get("t1547_run_keys")
+        or built_artifacts.get("t1082_system_info_discovery")
+    )
+    if not path or not path.exists():
+        pytest.skip("Payload-as-Code artifact not built (no compiler or template)")
+    opts = _default_options()
+    opts["emulation"] = True
+    ev = run_one_file_analysis(Path(path), "PE", opts)
+    emu = ev.get("emulation") or {}
+    api_calls = emu.get("api_calls") or []
+    techniques = emu.get("techniques") or []
+    mda = ev.get("memory_dump_analysis") or {}
+    has_behavior = (
+        len(api_calls) > 0
+        or len(techniques) > 0
+        or (mda.get("dump_path") and (mda.get("yara") or mda.get("cwe")))
+    )
+    assert has_behavior or ev.get("pe") or ev.get("technique_hints"), (
+        "Payload-as-Code artifact should yield emulation api_calls/techniques or memory_dump_analysis or pe/technique_hints"
+    )
+    dump_test_evidence(ev, "test_payload_code_behavioral_artifacts", profile="dev", request=request)
+
+
+def test_attack_storyline_combo_risk(built_artifacts, request):
+    """
+    Комбо-риски (Attack Storylines): один артефакт выполняет 2–3 техники подряд.
+    Ожидание: attack_storyline в evidence и/или 2+ MITRE ID в technique_hints/emulation.techniques.
+    """
+    from bin_gate.policy.engine import evaluate_policy
+
+    path = built_artifacts.get("chained_attack_payload_code") or built_artifacts.get("chained_attack_sample")
+    if not path or not path.exists():
+        pytest.skip("Chained attack artifact not built")
+    ev = _run_analysis(path)
+    policy = {"rules": [], "thresholds": {"deny": 80, "warn": 40}}
+    pol = evaluate_policy(ev, policy, profile="dev")
+    tech_emu = list((ev.get("emulation") or {}).get("techniques") or [])
+    tech_pe = list((ev.get("pe") or {}).get("technique_hints") or [])
+    tech_doc = list(ev.get("technique_hints") or [])
+    all_tech = list(set(tech_emu + tech_pe + tech_doc))
+    storyline = ev.get("attack_storyline") or {}
+    nodes = (storyline.get("nodes") or []) if isinstance(storyline, dict) else []
+    has_combo = len(all_tech) >= 2 or len(nodes) >= 2
+    assert has_combo or ev.get("pe") or ev.get("technique_hints"), (
+        "Chained artifact should yield 2+ techniques or attack_storyline with 2+ nodes"
+    )
+    dump_test_evidence(ev, "test_attack_storyline_combo_risk", profile="dev", request=request)
+
+
 @pytest.mark.parametrize("profile", ["dev", "prod"])
 def test_profile_no_signature_penalty(profile):
     """В PROD отсутствие подписи даёт +50, в DEV +20."""

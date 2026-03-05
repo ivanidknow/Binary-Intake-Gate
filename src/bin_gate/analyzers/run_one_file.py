@@ -558,9 +558,19 @@ def run_one_file_analysis(
                     if any(x in pl for x in ADVANCED_PROTECTOR_EXTENDED_NAMES):
                         _extended_protector_120 = True
                     break
+    # Высокая энтропия (libEngine13.so и др.) — форсируем эмуляцию для получения memory dump
+    if not _force_emulation_advanced:
+        _entropy_threshold = 7.2
+        obf = out.get("obfuscation") or {}
+        ent = out.get("entropy") or {}
+        if isinstance(obf, dict) and obf.get("max_section_entropy") is not None and float(obf.get("max_section_entropy", 0)) > _entropy_threshold:
+            _force_emulation_advanced = True
+        elif isinstance(ent, dict) and ent.get("file") is not None and float(ent.get("file", 0)) > _entropy_threshold:
+            _force_emulation_advanced = True
     BIN_GATE_ENABLE_EMULATION = os.getenv("BIN_GATE_ENABLE_EMULATION", "")
     _emu_dbg(f"[emu_dbg] Attempting emulation for {path}, enabled={BIN_GATE_ENABLE_EMULATION}, opt(emulation)={opt('emulation', False)}, kind={kind}, skip_heavy={skip_heavy}, force_advanced={_force_emulation_advanced}, extended_120={_extended_protector_120}")
-    if not out.get("short_circuit_deny") and (opt("emulation", False) or _force_emulation_advanced) and kind == "PE" and (not skip_heavy or _force_emulation_advanced):
+    _allow_elf_for_dump = _force_emulation_advanced and kind == "ELF"
+    if not out.get("short_circuit_deny") and (opt("emulation", False) or _force_emulation_advanced) and (kind == "PE" or _allow_elf_for_dump) and (not skip_heavy or _force_emulation_advanced):
         t_emu = time.perf_counter()
         _emu_dbg(f"[emu_dbg] Starting emulation for {path} (force_advanced={_force_emulation_advanced}, extended_120={_extended_protector_120})")
         try:
@@ -572,7 +582,7 @@ def run_one_file_analysis(
                     path,
                     timeout=emu_timeout,
                     enable=True,
-                    file_type="PE",
+                    file_type=kind if kind in ("PE", "ELF") else "PE",
                     complex_protector=_force_emulation_advanced,
                     extended_protector=_extended_protector_120,
                 )

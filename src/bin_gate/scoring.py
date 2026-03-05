@@ -15,6 +15,7 @@ RISK_HIGH_ENTROPY = 25       # Энтропия > 7.2 → обфускация
 RISK_URLHAUS_HIT = 40        # URL/домен в URLHaus
 RISK_VMPROTECT = 100         # VMProtect (уже обрабатывается политикой)
 RISK_MASQUERADING = 20      # Иконка документа (Excel/PDF/Word/Image), файл — PE
+RISK_HIDDEN_WINDOW = 15     # T1564.003 — скрытое окно (ShowWindow SW_HIDE / CREATE_NO_WINDOW)
 RISK_DEFENSE_EVASION_3 = 15  # Более 3 техник в категории Defense Evasion (capa)
 RISK_ANTI_VM = 15            # Детекция Anti-VM / Anti-Analysis (CPUID, RDTSC, гипервизор)
 RISK_EVASION_TECHNIQUE = 30   # Техники уклонения: отладочные API (IsDebuggerPresent и др.) в PE
@@ -78,10 +79,33 @@ RISK_ATTACK_CHAIN_COMBO = 40
 RISK_EXTERNAL_C2_MATCH = 60       # IP/домен в C2-активности (AbuseIPDB/фиды) — блокировка
 RISK_SUSPICIOUS_ASN = 25          # Нетипичный хостинг (VPS/анонимный) по Whois/ASN
 RISK_UNCERTAIN_PUBLISHER = 10     # Издатель не в белом списке (только при наличии др. статического риска или Deep)
+RISK_LD_PRELOAD_LEGIT = 10        # LD_PRELOAD в контексте Firebird/Interbase (легитимный аудит) — информационно
 # RISK_SUPPLY_CHAIN_TAMPERING = 80 уже задан выше (T1195.002)
 
 # Порог энтропии для "High Risk: Obfuscated"
 ENTROPY_MANUAL_REVIEW_THRESHOLD = 7.2
+
+
+def _is_firebird_ecosystem(ev: Dict[str, Any]) -> bool:
+    """Проверка контекста Firebird/Interbase: легитимное использование LD_PRELOAD для аудита (fbtrace и др.)."""
+    path = (ev.get("meta") or {}).get("path") or ev.get("path") or ""
+    name = (ev.get("meta") or {}).get("name") or ""
+    path_lower = (str(path) + " " + str(name)).lower()
+    if any(x in path_lower for x in ("firebird", "interbase", "fbtrace", "libengine", "engine13", "gds", "ib_util")):
+        return True
+    for chunk in (ev.get("emulation") or {}).get("decoded_strings") or []:
+        if not isinstance(chunk, str):
+            continue
+        c = chunk.lower()
+        if "firebird" in c or "interbase" in c or "fbtrace" in c:
+            return True
+    for s in (ev.get("strings") or [])[:200]:
+        if not isinstance(s, str):
+            continue
+        c = s.lower()
+        if any(x in c for x in ("firebird", "interbase", "fbtrace", "libengine", "gds", "ib_util")):
+            return True
+    return False
 
 # Маппинг подстрок scoring_reasons → MITRE ID для highlights["mitre_techniques"]
 # Если в reasons появилась строка, содержащая ключ, добавляются соответствующие ID
@@ -456,6 +480,8 @@ def compute_risk_score(ev: Dict[str, Any], profile: str = "dev") -> int:
             score += RISK_HOSTS_MODIFICATION
         if "T1546.003" in th and not (isinstance(pe.get("behavior_hints"), dict) and pe.get("behavior_hints", {}).get("wmi_subscription")):
             score += RISK_WMI_SUBSCRIPTION
+        if "T1564.003" in th or any(t and "T1564.003" in str(t) for t in (ev.get("emulation") or {}).get("techniques") or []):
+            score += RISK_HIDDEN_WINDOW
     # Internal network scan / domain enum from network_profile if not from hints
     net = ev.get("network_profile") or {}
     if isinstance(net, dict) and net.get("internal_ip_scan_suspect") and not (isinstance(pe, dict) and (pe.get("behavior_hints") or {}).get("internal_network_scan")):
@@ -527,9 +553,11 @@ def compute_risk_score(ev: Dict[str, Any], profile: str = "dev") -> int:
         if any(t and "T1570" in str(t) for t in emu_tech):
             score += RISK_LATERAL_TRANSFER_ATTEMPT
 
-    # YARA: находки из внешних баз (malware / Yara-Rules / Neo23x0) — +70
+    # YARA: находки из внешних баз (malware / Yara-Rules / Neo23x0) — +70; LD_PRELOAD в контексте Firebird/Interbase — +10
     yara_hits = ev.get("yara") or []
     if isinstance(yara_hits, list):
+        rule_names_lower = " ".join(str(h.get("rule") or "") for h in yara_hits if isinstance(h, dict)).lower()
+        ldpreload_context = "ldpreload" in rule_names_lower and any(x in rule_names_lower for x in ("dynamic_api", "api_resolve", "dynamic_api_resolve"))
         for h in yara_hits:
             if not isinstance(h, dict):
                 continue
@@ -542,7 +570,10 @@ def compute_risk_score(ev: Dict[str, Any], profile: str = "dev") -> int:
             meta = h.get("meta") or {}
             cat = str(meta.get("category") or meta.get("family") or "").lower()
             if "malware" in cat or "malware" in ns or "yara-rules" in ns or "neo23x0" in ns or "external" in ns:
-                score += RISK_YARA_MALWARE
+                if ldpreload_context and _is_firebird_ecosystem(ev):
+                    score += RISK_LD_PRELOAD_LEGIT
+                else:
+                    score += RISK_YARA_MALWARE
                 break
 
     # Deep Memory Scan: вредоносная сигнатура в дампе памяти — критический фактор
@@ -810,7 +841,12 @@ def get_risk_reason_strings(ev: Dict[str, Any], profile: str = "dev") -> List[st
             meta = h.get("meta") or {}
             cat = str(meta.get("category") or meta.get("family") or "").lower()
             if "malware" in cat or "malware" in ns or "yara-rules" in ns or "neo23x0" in ns or "external" in ns:
-                reasons.append("Обнаружена сигнатура вредоносного ПО (внешняя база YARA)")
+                rule_names_lower = " ".join(str(x.get("rule") or "") for x in (ev.get("yara") or []) if isinstance(x, dict)).lower()
+                ldpreload_ctx = "ldpreload" in rule_names_lower and any(x in rule_names_lower for x in ("dynamic_api", "api_resolve", "dynamic_api_resolve"))
+                if ldpreload_ctx and _is_firebird_ecosystem(ev):
+                    reasons.append("LD_PRELOAD в контексте Firebird/Interbase (легитимный механизм аудита БД).")
+                else:
+                    reasons.append("Обнаружена сигнатура вредоносного ПО (внешняя база YARA)")
                 break
 
     # Экзотические языки (Nim, AutoIt) — часто используются для дропперов
@@ -1008,6 +1044,8 @@ def get_risk_mitre_techniques(ev: Dict[str, Any], profile: str = "dev") -> List[
     Возвращает список MITRE ATT&CK ID по тем же условиям, что и get_risk_reason_strings.
     Используется для заполнения ev["highlights"]["mitre_techniques"] при обнаружении
     специфических причин (например, «Попытка отключения защиты» -> T1562).
+    Корректно объединяет статические хинты (pe.technique_hints, ev.technique_hints)
+    и техники эмуляции (emulation.techniques), чтобы все попадали в highlights.mitre_techniques.
     """
     mitre: List[str] = []
     pe = ev.get("pe") or {}
@@ -1068,6 +1106,10 @@ def get_risk_mitre_techniques(ev: Dict[str, Any], profile: str = "dev") -> List[
     # v1.0: все остальные подтехники из th_hints (T1055.003 Thread Hijacking, T1070.006 Timestomp и т.д.)
     for t in th_hints:
         if t and isinstance(t, str) and t.startswith("T") and t[1:].replace(".", "").isdigit():
+            mitre.append(t)
+    # Объединение с эмуляцией: все MITRE ID из emulation.techniques попадают в highlights.mitre_techniques
+    for t in emu_tech:
+        if t and isinstance(t, str) and t.startswith("T") and len(t) > 1 and t[1:].replace(".", "").isdigit():
             mitre.append(t)
 
     return list(dict.fromkeys(mitre))  # preserve order, no duplicates
@@ -1165,10 +1207,15 @@ def build_deny_justification(ev: Dict[str, Any], policy_result: Dict[str, Any]) 
     if isinstance(yara_hits, list):
         rule_names = " ".join(str(h.get("rule") or "") for h in yara_hits if isinstance(h, dict)).lower()
         if "ldpreload" in rule_names and ("dynamic_api" in rule_names or "api_resolve" in rule_names or "dynamic_api_resolve" in rule_names):
-            expert_phrases.append(
-                "Выявлены признаки поведения типа Rootkit: использование LD_PRELOAD для перехвата системных функций "
-                "и скрытие таблицы импортов через динамический резолв."
-            )
+            if _is_firebird_ecosystem(ev):
+                expert_phrases.append(
+                    "LD_PRELOAD обнаружен в контексте экосистемы Firebird/Interbase (легитимный механизм аудита БД)."
+                )
+            else:
+                expert_phrases.append(
+                    "Выявлены признаки поведения типа Rootkit: использование LD_PRELOAD для перехвата системных функций "
+                    "и скрытие таблицы импортов через динамический резолв (MITRE T1574.006)."
+                )
     obf = ev.get("obfuscation") or {}
     packed = isinstance(obf, dict) and obf.get("packed_suspect") is True
     if is_high_entropy_obfuscated(ev) and packed:
@@ -1181,11 +1228,26 @@ def build_deny_justification(ev: Dict[str, Any], policy_result: Dict[str, Any]) 
             "Критическая степень обфускации затрудняет статический анализ, "
             "что характерно для упакованных вредоносных модулей."
         )
+    # Интеллектуальный вердикт: если риск высокий из-за находок в дампе памяти — первой строкой justification идёт критическая угроза
+    mda = ev.get("memory_dump_analysis") or {}
+    yara_in_mem = (mda.get("yara") or [])
+    has_memory_threat = any(
+        isinstance(h, dict) and (h.get("rule") or "") not in ("yara_skipped_large_file", "yara_error", "yara_match_error", "yara_truncated")
+        for h in yara_in_mem
+    ) if isinstance(yara_in_mem, list) else False
     reasons = policy_result.get("reasons") or []
+    rule_names = [str(h.get("rule") or h.get("name") or "").strip() for h in (yara_in_mem or []) if isinstance(h, dict) and (h.get("rule") or "") not in ("yara_skipped_large_file", "yara_error", "yara_match_error", "yara_truncated")]
     if reasons or expert_phrases:
         critical_memory = [r for r in reasons if "КРИТИЧЕСКАЯ УГРОЗА" in str(r) or "дампе памяти" in str(r)]
         rest = [r for r in reasons if r not in critical_memory]
-        ordered = expert_phrases + critical_memory + rest[:15]
+        if has_memory_threat and not critical_memory:
+            mem_line = "КРИТИЧЕСКАЯ УГРОЗА: Вредоносная сигнатура обнаружена в дампе памяти (Deep Memory Scan)"
+            if rule_names:
+                mem_line += " [правила: " + ", ".join(rule_names[:10]) + "]"
+            critical_memory = [mem_line]
+        elif has_memory_threat and critical_memory and rule_names:
+            critical_memory[0] = str(critical_memory[0]) + " [правила: " + ", ".join(rule_names[:10]) + "]"
+        ordered = critical_memory + expert_phrases + rest[:15]
         return "Заблокировано: " + "; ".join(str(r) for r in ordered) + "."
 
     parts: List[str] = []
@@ -1242,6 +1304,10 @@ def build_deny_justification(ev: Dict[str, Any], policy_result: Dict[str, Any]) 
             parts.append("критическое несоответствие: файл маскируется под документ, являясь исполняемым")
 
     if not parts:
+        if has_memory_threat:
+            return "Заблокировано: КРИТИЧЕСКАЯ УГРОЗА: Вредоносная сигнатура обнаружена в дампе памяти (Deep Memory Scan)."
         return "Заблокировано по результатам анализа."
 
+    if has_memory_threat:
+        return "Заблокировано: КРИТИЧЕСКАЯ УГРОЗА: Вредоносная сигнатура обнаружена в дампе памяти (Deep Memory Scan); " + ", ".join(parts) + "."
     return "Заблокировано: " + ", ".join(parts) + "."

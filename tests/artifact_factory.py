@@ -3,7 +3,10 @@
 # v1.1: Evasion engines (obfuscate_payload, wrap_in_unpacker), Rust/Go/PyInstaller/ packed T1055.
 
 from __future__ import annotations
+import os
 import struct
+import shutil
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -20,6 +23,9 @@ def _align(size: int, alignment: int) -> int:
 
 # ---------------------------------------------------------------------------
 # Evasion engines (Artifact Factory v1.1)
+# Legacy: wrap_in_unpacker и build_* на базе _minimal_pe_base формируют PE с оверлеем (имитация).
+# Они сохранены для обратной совместимости и для достижения 250+ артефактов при отсутствии компилятора.
+# При наличии gcc/mingw Payload-as-Code перезаписывает/дополняет артефакты реальными C-шаблонами.
 # ---------------------------------------------------------------------------
 
 def obfuscate_payload(data: bytes, method: str = "xor", key: Optional[int] = None) -> bytes:
@@ -3611,6 +3617,57 @@ def build_all(out_dir: Path) -> Dict[str, Path]:
     result["stego_payload_sample"] = build_stego_payload_sample(out_dir / "sample_stego_payload.exe")
     # v3.2 OSINT: образец с C2-IoC для тестов репутации
     result["sample_with_malicious_ioc"] = build_sample_with_malicious_ioc(out_dir / "sample_malicious_ioc.exe")
+
+    # Payload-as-Code: реальная компиляция C-шаблонов (CompilerCore + ArtifactRegistry).
+    # Если компилятор недоступен в PATH — добавляем типичный путь MSYS2 (Windows).
+    _payload_code_errors: List[str] = []
+    try:
+        if sys.platform == "win32":
+            _gcc_path = shutil.which("gcc") or shutil.which("gcc.exe")
+            if not _gcc_path:
+                for _d in ("C:\\msys64\\ucrt64\\bin", "C:\\msys64\\mingw64\\bin", "C:\\msys2\\ucrt64\\bin"):
+                    if (Path(_d) / "gcc.exe").exists():
+                        _path = os.environ.get("PATH", "")
+                        if _d not in _path:
+                            os.environ["PATH"] = _d + os.pathsep + _path
+                        break
+        try:
+            _tests_dir = Path(__file__).resolve().parent
+        except Exception:
+            _tests_dir = Path("tests").resolve()
+        if _tests_dir.exists() and (_tests_dir / "payload_code").exists() and str(_tests_dir) not in sys.path:
+            sys.path.insert(0, str(_tests_dir))
+        from payload_code import get_registry, CompilerCore
+        from payload_code.pipeline import build_artifact as build_payload_artifact
+        registry = get_registry()
+        compiler = CompilerCore()
+        if compiler.available:
+            for spec in registry.specs_with_templates():
+                out_path = out_dir / f"sample_{spec.test_id}_payload.exe"
+                res = build_payload_artifact(compiler, spec, out_path, apply_pack=(spec.pack != "none"))
+                if res.success and res.output_path:
+                    result[spec.test_id] = res.output_path
+                else:
+                    stderr_lines = (res.stderr or "").strip().splitlines()[:3]
+                    stderr_preview = "\n  ".join(stderr_lines).strip() if stderr_lines else ""
+                    err = res.error or "Compile failed"
+                    msg = f"[{spec.test_id}] {err}"
+                    if stderr_preview:
+                        msg += "\n  " + stderr_preview[:500]
+                    _payload_code_errors.append(msg)
+        else:
+            _payload_code_errors.append("CompilerCore: gcc/mingw not found (PATH and MSYS2 fallback)")
+    except ImportError as e:
+        _payload_code_errors.append(f"Payload-as-Code import failed: {e}")
+    except Exception as e:
+        _payload_code_errors.append(f"Payload-as-Code build failed: {e}")
+
+    if _payload_code_errors:
+        for _err in _payload_code_errors[:15]:
+            print(_err, file=sys.stderr)
+        if len(_payload_code_errors) > 15:
+            print(f"... and {len(_payload_code_errors) - 15} more", file=sys.stderr)
+
     return result
 
 

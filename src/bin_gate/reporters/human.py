@@ -1455,8 +1455,7 @@ def _append_static_section_threat_groups(
 
 def _build_expert_justification_many_files(evidences: list, threat_groups: dict[str, list]) -> str:
     """
-    Итоговое обоснование (Verdict) на основе агрегированных данных:
-    «Заблокировано: Системное использование техник сокрытия кода в {N} файлах. Наличие сигнатур Meterpreter в скриптах инсталляции».
+    Экспертный синтез justification: LD_PRELOAD (Rootkit-behavior), высокая энтропия, Meterpreter в скриптах.
     """
     rootkit = threat_groups.get("group_rootkit") or []
     scripts = threat_groups.get("group_suspicious_scripts") or []
@@ -1465,8 +1464,14 @@ def _build_expert_justification_many_files(evidences: list, threat_groups: dict[
     if n_files == 0 and scripts:
         n_files = len(scripts)
     parts: list[str] = []
-    if n_files > 0:
+    if rootkit:
+        parts.append(
+            "Заблокировано: Системная аномалия LD_PRELOAD (Rootkit-behavior) в сочетании с высокой энтропией."
+        )
+    if n_files > 0 and not rootkit:
         parts.append(f"Заблокировано: Системное использование техник сокрытия кода в {n_files} файлах.")
+    if obf and not rootkit:
+        parts.append(f"Критическая обфускация в {len(obf)} файлах.")
     if scripts:
         parts.append("Наличие сигнатур Meterpreter в скриптах инсталляции.")
     if not parts:
@@ -1530,10 +1535,10 @@ def _format_cwe(cwe_id: str, raw_name: str = "") -> str:
 
 
 def _append_cwe_section(lines: list[str], evidences: list) -> None:
-    """Подраздел «Анализ бинарного кода (CWE)». Пустые данные — «не обнаружено»; при наличии — таблица; если аудит прошёл без багов — [X] и подтверждение."""
+    """Подраздел «Анализ бинарного кода (CWE)». Пустые данные — явное сообщение о проверке Docker; при наличии — таблица."""
     has_any_cwe = any(isinstance(e.get("cwe_analysis"), dict) for e in evidences)
     if not has_any_cwe:
-        lines.append("— *Анализ бинарного кода (CWE)*: Специфических логических уязвимостей бинарного кода (CWE) не обнаружено.")
+        lines.append("— *Анализ бинарного кода (CWE)*: Сканер CWE не вернул данных (проверьте Docker fkiecad/cwe_checker).")
         return
     cwe_findings: list[tuple[str, str, str, bool]] = []  # (cwe_id, описание, функция, is_critical)
     cwe_errors: list[str] = []
@@ -1608,10 +1613,13 @@ def _append_scan_depth_section(lines: list[str], evidences: list) -> None:
     cve_label = f"Выполнено (Syft+Grype, {cve_result})"
     cve_ok = True  # проверка CVE выполнялась (результат 0 или N)
 
-    # Чек-боксы синхронизированы с результатами из JSON: CWE [X] только если анализ был запущен
-    cwe_done = any(isinstance(e.get("cwe_analysis"), dict) for e in evidences)
+    # [X] в чек-листе CWE только если в 'cwe_analysis' действительно поступили данные (успешный запуск или находки)
     cwe_count = sum(len((_get(e, "cwe_analysis") or {}).get("findings") or []) for e in evidences)
-    cwe_ok = cwe_done
+    cwe_ok = any(
+        isinstance(e.get("cwe_analysis"), dict)
+        and ((e.get("cwe_analysis") or {}).get("return_code") == 0 or len((e.get("cwe_analysis") or {}).get("findings") or []) > 0)
+        for e in evidences
+    )
     if cwe_ok and cwe_count:
         cwe_label = f"Выполнено (cwe_checker, {cwe_count} находок)"
     elif cwe_ok:
@@ -1729,36 +1737,77 @@ def _append_mitre_matrix(lines: list[str], evidences: list) -> None:
 
 
 def _append_memory_dump_section(lines: list[str], evidences: list) -> None:
-    """Результаты анализа дампа памяти (Deep Memory Scan) с префиксом [MEMORY DUMP]."""
-    has_any = any((ev.get("memory_dump_analysis") or {}).get("dump_path") for ev in evidences)
+    """Блок [MEMORY DUMP]: YARA-находки и техники из дампа памяти; при эмуляции без дампа — «активности не обнаружено»."""
+    has_any = any(
+        (ev.get("memory_dump_analysis") or {}).get("dump_path")
+        or ((ev.get("memory_dump_analysis") or {}).get("yara") and len((ev.get("memory_dump_analysis") or {}).get("yara") or []) > 0)
+        or (ev.get("emulation") or {}).get("memory_dump_path")
+        or (ev.get("emulation") or {}).get("success")
+        for ev in evidences
+    )
     if not has_any:
+        lines.append("")
+        lines.append("*[MEMORY DUMP] Анализ дампа памяти (эмуляция)*")
+        lines.append("")
+        lines.append("— *[MEMORY DUMP]*: Данные дампа памяти отсутствуют (эмуляция не выполнялась или дамп не создан).")
         return
     lines.append("")
-    lines.append("*[MEMORY DUMP] Анализ дампа памяти (второй круг)*")
+    lines.append("*[MEMORY DUMP] Анализ дампа памяти (эмуляция)*")
     lines.append("")
     for ev in evidences:
         mda = ev.get("memory_dump_analysis") or {}
-        if not mda.get("dump_path"):
+        emu = ev.get("emulation") or {}
+        dump_path = mda.get("dump_path") or emu.get("memory_dump_path")
+        yara_hits = mda.get("yara") or []
+        skip_rules = {"yara_skipped_large_file", "yara_error", "yara_match_error", "yara_truncated"}
+        real_yara = [h for h in yara_hits if isinstance(h, dict) and (h.get("rule") or "") not in skip_rules and (h.get("namespace") or "") != "errors"]
+        if not dump_path and not real_yara and not emu.get("success"):
             continue
         name = (ev.get("meta") or {}).get("path") or ev.get("path") or "?"
         name = Path(name).name if isinstance(name, str) else str(name)
-        dump_name = Path(mda.get("dump_path", "")).name
+        dump_name = Path(dump_path or "").name if dump_path else "—"
         lines.append(f"— *[MEMORY DUMP]* файл: {name} → дамп: {dump_name}")
-        yara_hits = mda.get("yara") or []
-        if isinstance(yara_hits, list) and yara_hits:
-            unique_rule_names = list(dict.fromkeys(
-                (h.get("rule") or h.get("name") or str(h)[:50]) for h in yara_hits if isinstance(h, dict)
-            ))
-            unique_rule_names = [r for r in unique_rule_names if r]
-            lines.append(f"  YARA: {len(unique_rule_names)} уникальных правил ({len(yara_hits)} сработок)")
-            for r in unique_rule_names[:10]:
-                lines.append(f"    • {r}")
-            if len(unique_rule_names) > 10:
-                lines.append(f"    … и ещё {len(unique_rule_names) - 10}")
+        if real_yara:
+            lines.append(f"  YARA-хиты в памяти ({len(real_yara)} сработок):")
+            lines.append("")
+            lines.append("  | Правило | Namespace | Описание |")
+            lines.append("  | :--- | :--- | :--- |")
+            for h in real_yara[:25]:
+                rule = (h.get("rule") or h.get("name") or "—")[:40]
+                ns = (h.get("namespace") or "—")[:25]
+                desc = (str((h.get("meta") or {}).get("description") or (h.get("meta") or {}).get("name") or "—"))[:50]
+                lines.append(f"  | {rule} | {ns} | {desc} |")
+            if len(real_yara) > 25:
+                lines.append(f"  | … и ещё {len(real_yara) - 25} | — | — |")
+            lines.append("")
+        elif dump_path or emu.get("success"):
+            lines.append("  Активности вредоносного кода в памяти не обнаружено.")
+            lines.append("")
+        # Выявленные техники (T1055 и т.д.) из эмуляции/памяти
+        def _tech_id(t):
+            if isinstance(t, str):
+                return t if (t.startswith("T") or "T1055" in t) else None
+            if isinstance(t, dict):
+                return t.get("id") or t.get("technique") or t.get("name")
+            return None
+        techniques = (ev.get("emulation") or {}).get("techniques") or []
+        capa_tech = (ev.get("capa") or {}).get("techniques") or []
+        attck = (ev.get("capa") or {}).get("attck_by_tactic") or {}
+        if isinstance(attck, dict):
+            for _tactic, tech_list in attck.items():
+                if isinstance(tech_list, list):
+                    capa_tech.extend(tech_list)
+        all_tech = list(dict.fromkeys(
+            x for x in (_tech_id(t) for t in techniques + capa_tech) if x
+        ))
+        if all_tech:
+            lines.append(f"  Выявленные техники из памяти/эмуляции: {', '.join(all_tech[:15])}")
+            if len(all_tech) > 15:
+                lines.append(f"    … и ещё {len(all_tech) - 15}")
         cwe = mda.get("cwe") or {}
         findings = cwe.get("findings") or []
         if findings:
-            lines.append(f"  CWE: {len(findings)} находок")
+            lines.append(f"  CWE по дампу: {len(findings)} находок")
             for f in findings[:5]:
                 desc = (f.get("name") or f.get("description") or f.get("cwe") or str(f))[:80]
                 lines.append(f"    • {desc}")
@@ -1909,8 +1958,8 @@ def _ident_aggregation_key(pf: dict) -> tuple:
 
 def _group_files_by_metadata(arr: list) -> dict[tuple, list]:
     """
-    Агрессивная группировка ELF для раздела 1: ключ (RPATH, stripped, static).
-    При идентичных метаданных выводим только общее описание и список имён.
+    Жёсткая группировка ELF: ключ (interp, RWX-LOAD, stripped, static, rpath).
+    При идентичных interp, RWX-LOAD и stripped — общее описание один раз на группу, затем список имён.
     """
     by_meta: dict[tuple, list] = defaultdict(list)
     for pf in arr:
@@ -1919,9 +1968,11 @@ def _group_files_by_metadata(arr: list) -> dict[tuple, list]:
         if kind == "ELF":
             h = _get(ev, "elf.hardening") or {}
             rpath = (h.get("rpath") or "") if isinstance(h, dict) else ""
+            interp = _get(ev, "elf.interp") or ""
+            rwx_load = bool(_get(ev, "elf.hardening.w_x_segments"))
             stripped = _get(ev, "elf.stripped")
             static = _get(ev, "elf.static_linked")
-            key = ("ELF", rpath, bool(stripped), bool(static))
+            key = ("ELF", interp, rwx_load, bool(stripped), bool(static), rpath)
         else:
             key = _ident_aggregation_key(pf)
         by_meta[key].append(pf)
@@ -1960,7 +2011,7 @@ def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_fil
             ELF_SAME_META_MIN = 1  # схлопывать при совпадении метаданных (даже 1 файл в группе — выводим список имён)
             seen_paths: set = set()
             for key, sub in by_meta.items():
-                if len(key) >= 4 and key[0] == "ELF" and len(sub) > ELF_SAME_META_MIN:
+                if len(key) >= 6 and key[0] == "ELF" and len(sub) > ELF_SAME_META_MIN:
                     names = []
                     for pf in sub:
                         ev = pf.get("ev") or {}
@@ -1975,13 +2026,12 @@ def _append_ident_section(lines: list[str], *, groups: dict[str, list], show_fil
                     name_list = ", ".join(names[:15])
                     if len(names) > 15:
                         name_list += f" и ещё {len(names) - 15}"
-                    rpath, stripped, static = key[1], key[2], key[3]
-                    params = []
+                    interp, rwx_load, stripped, static, rpath = key[1], key[2], key[3], key[4], key[5]
+                    # Один раз для всей группы: interp, RWX-LOAD, stripped (не выводим для каждого файла)
+                    params = [f"interp={interp or '—'}", f"RWX-LOAD={rwx_load}", f"stripped={stripped}", f"static={static}"]
                     if rpath:
                         params.append(f"RPATH={repr(rpath)}")
-                    params.append("stripped" if stripped else "not stripped")
-                    params.append("static" if static else "dynamic")
-                    lines.append(f"— *Группа:* {len(sub)} ELF с одинаковыми параметрами ({', '.join(params)}): {name_list}")
+                    lines.append(f"— *Группа:* {len(sub)} ELF с идентичными параметрами ({', '.join(params)}): {name_list}")
                 elif len(sub) > COLLAPSE_THRESHOLD and (not key or key[0] != "ELF"):
                     kind = key[0] if key else "?"
                     rest = list(key[1:]) if len(key) > 1 else []
@@ -2176,16 +2226,23 @@ def _append_reputation_section(
             files_with_vt += 1
             any_vt = True
 
-    # Если по всем файлам в VirusTotal 0 детектирований — одна итоговая строка вместо пофайлового списка
+    # Если по всем файлам в VT 0 детектирований — весь Раздел 2 заменяем одной итоговой строкой
     all_clean = (files_with_vt > 0 and agg["m"] == 0 and agg["s"] == 0)
     unique_hashes_n = files_with_vt
-    if all_clean:
+    if files_with_vt == 0:
         lines.append("")
-        lines.append(f"Проверено {unique_hashes_n} хэша(ей), угроз не обнаружено.")
+        total_n = len(per_file)
+        lines.append("Файлы не найдены в базе VirusTotal." + (f" (0 из {total_n} файлов.)" if total_n else ""))
+        lines.append("")
+        show_files = False
+    elif all_clean:
+        lines.append("")
+        lines.append(f"Все {unique_hashes_n} файлов проверены в VirusTotal, репутационных угроз не обнаружено.")
         lines.append("")
         show_files = False
     else:
-        base = f"* Все файлы:* VT m/s/h/u = {agg['m']}/{agg['s']}/{agg['h']}/{agg['u']} ; files={files_with_vt}/{len(per_file)}"
+        total_n = len(per_file)
+        base = f"* Все файлы:* VT m/s/h/u = {agg['m']}/{agg['s']}/{agg['h']}/{agg['u']} ; files={files_with_vt}/{total_n}"
         if agg["bh"] > 0:
             base += f" ; behaviours={agg['bh']}"
         lines.append(base)

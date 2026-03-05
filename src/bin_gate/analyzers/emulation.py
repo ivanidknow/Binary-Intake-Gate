@@ -277,6 +277,7 @@ API_TO_TECHNIQUE = {
     "SetFileTime": ["T1070.006", "timestomp"],
     "GetFileTime": ["T1070.006", "timestomp"],
     "IWbemServices_PutInstance": ["T1546.003", "wmi-subscription"],
+    "IWbemServices_ExecMethod": ["T1546.003", "wmi-subscription"],
     "IWbemClassObject": ["T1546.003", "wmi-subscription"],
     "GetIpForwardTable": ["T1016.001", "network-config-discovery"],
     "NetGroupEnum": ["T1069.002", "domain-groups-discovery"],
@@ -290,6 +291,14 @@ API_TO_TECHNIQUE = {
     "EtwEventWrite": ["T1562.002", "impair-defenses"],
     "CoInitializeEx": ["T1021.003", "lateral-movement"],
     "CoCreateInstanceEx": ["T1021.003", "lateral-movement"],
+    # DNS API (Payload-as-Code / T1071.004)
+    "DnsQuery_A": ["T1071.004", "dns-protocol"],
+    "DnsQuery_W": ["T1071.004", "dns-protocol"],
+    "DnsQuery_UTF8": ["T1071.004", "dns-protocol"],
+    "DnsRecordListFree": ["T1071.004", "dns-protocol"],
+    # WMI (Payload-as-Code / T1546.003) — IWbemServices::ExecMethod and related
+    "IWbemLocator_ConnectServer": ["T1546.003", "wmi-subscription"],
+    "IWbemServices_ConnectServer": ["T1546.003", "wmi-subscription"],
 }
 
 
@@ -362,9 +371,21 @@ def _detect_sequential_techniques(api_calls: List[Dict[str, Any]]) -> List[str]:
     if reg_set and reg_create:
         added.add("T1548.002")
         added.add("uac-bypass")
-    # Hidden window: CreateProcess often used with CREATE_NO_WINDOW (0x08000000) or SW_HIDE
+    # T1564.003 Hidden Window: ShowWindow(hwnd, nCmdShow) with nCmdShow == 0 (SW_HIDE)
+    for c in api_calls:
+        if not isinstance(c, dict):
+            continue
+        if c.get("api") == "ShowWindow":
+            args = c.get("args") or []
+            if len(args) >= 2:
+                n_cmd = args[1]
+                if n_cmd == 0 or str(n_cmd).strip() in ("0", "0x0") or "sw_hide" in str(n_cmd).lower():
+                    added.add("T1564.003")
+                    added.add("hidden-window")
+                    break
+    # CreateProcessA/CreateProcessW with CREATE_NO_WINDOW (0x08000000) or SW_HIDE in args
     create_proc = any("CreateProcess" in n for n in names)
-    if create_proc and any("CreateProcess" in n for n in names):
+    if create_proc:
         for c in api_calls:
             if not isinstance(c, dict):
                 continue
@@ -374,6 +395,12 @@ def _detect_sequential_techniques(api_calls: List[Dict[str, Any]]) -> List[str]:
                 added.add("T1564.003")
                 added.add("hidden-window")
                 break
+            if len(args) >= 6:
+                dw_creation = args[5] if len(args) > 5 else None
+                if dw_creation == 0x08000000 or dw_creation == 134217728 or str(dw_creation) == "0x08000000":
+                    added.add("T1564.003")
+                    added.add("hidden-window")
+                    break
     return sorted(added)
 
 
