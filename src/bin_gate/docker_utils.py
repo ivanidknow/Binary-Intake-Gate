@@ -12,7 +12,6 @@ from typing import Optional, Tuple, List, Dict, Any
 import subprocess
 import os
 import re as _re
-import stat
 import sys
 
 # Volume names for caching
@@ -540,16 +539,16 @@ def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     host_path = Path(file_path).resolve()
     if not host_path.exists():
         return {"findings": [], "error": "file_not_found", "return_code": -1, "stderr": ""}
-    # Чтобы контейнер мог прочитать файл (Permission Denied в CI/Docker)
+    # Принудительные права на файл, чтобы контейнер мог прочитать бинарник (Permission Denied в CI)
     try:
-        os.chmod(host_path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        os.chmod(host_path, 0o644)
     except OSError:
         pass
     host_dir = host_path.parent
-    # Монтируем родительский каталог в /share:ro, чтобы контейнер видел файл как /share/<name>
+    # Монтируем родительский каталог в /share:ro; --user root избегает конфликтов UID с томами
     container_file = f"/share/{host_path.name}"
     mount_arg = f"{host_dir}:/share:ro"
-    cmd = ["docker", "run", "--rm", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file, "--json"]
+    cmd = ["docker", "run", "--rm", "--user", "root", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file, "--json"]
     if debug:
         print(f"[DOCKER_CWE_DEBUG] cmd: {cmd}", flush=True)
         print(f"[DOCKER_CWE_DEBUG] host_path={host_path!r} mount={mount_arg!r} container_file={container_file!r}", flush=True)

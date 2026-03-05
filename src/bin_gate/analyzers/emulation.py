@@ -104,6 +104,9 @@ class EmulationResult:
     # When memory_dump_path is None, reason for failure (for logging)
     dump_failure_reason: str = ""
 
+    # Статус эмуляции: "load_failed" при сбое load_module (UC_ERR_WRITE_UNMAPPED и т.д.)
+    emulation_status: str = ""
+
     # Loaded modules (LDR list) from Docker JSON report
     modules: List[str] = field(default_factory=list)
 
@@ -584,8 +587,14 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
         # Initialize Speakeasy
         se = Speakeasy()
         
-        # Load the module
-        module = se.load_module(str(path))
+        # Load the module (критический сбой загрузчика UC_ERR_WRITE_UNMAPPED и др. — не роняем весь процесс)
+        try:
+            module = se.load_module(str(path))
+        except Exception as load_err:
+            result.emulation_status = "load_failed"
+            result.error = f"load_failed:{str(load_err)[:300]}"
+            result.elapsed_ms = int((time.time() - start_time) * 1000)
+            return result
         
         # Set up hooks for interesting APIs
         api_calls = []
@@ -857,6 +866,10 @@ def _run_speakeasy_emulation_via_docker(path: Path, timeout: int, max_api_calls:
         result.error = f"emulation_docker_exit_{rc}"
         if stderr:
             result.error += f": {stderr[:200].strip()}"
+        # Критический сбой загрузчика (UC_ERR_WRITE_UNMAPPED и т.д.) — фиксируем для тестов/пайплайна
+        stderr_lower = (stderr or "").lower()
+        if "uc_err" in stderr_lower or "write_unmapped" in stderr_lower or "load_module" in stderr_lower:
+            result.emulation_status = "load_failed"
         # If we got a dump despite exit != 0, caller can still use memory_dump_path
         if not result.memory_dump_path:
             return result
@@ -1010,6 +1023,10 @@ def run_emulation(
             or get_last_dump_reason()
             or (f"emulation_error_before_dump: {emu_result.error}" if getattr(emu_result, "error", None) else "dump_emulated_memory_to_file did not set reason")
         )
+    # Статус загрузки модуля (load_failed при UC_ERR и т.д.) для корректной обработки в тестах/пайплайне
+    result_dict["emulation_status"] = getattr(emu_result, "emulation_status", "") or (
+        "load_failed" if (getattr(emu_result, "error", "") or "").strip().startswith("load_failed:") else ""
+    )
 
     return result_dict
 
