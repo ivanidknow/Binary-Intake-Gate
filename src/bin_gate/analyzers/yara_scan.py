@@ -127,6 +127,19 @@ rule PACKER_ASPACK_PE {
             ( pe.sections[i].name == ".aspack" or pe.sections[i].name == ".adata" )
 }
 
+/* --- PyInstaller (детекция языка: language_analyzer YARA -> PyInstaller; строки для fallback в language_detector) ---
+   Паттерны: pyi-runtime-tmpdir, _MEIXXXXXX, _pyi_bootstrap (таблица импорта). */
+rule PACKER_PYINSTALLER_PE {
+    meta: author="builtin" family="packers" target="pe" severity="low" language="PyInstaller"
+    strings:
+        $pyi1 = "pyi-runtime-tmpdir" ascii
+        $pyi2 = "_MEI" ascii
+        $pyi3 = "_pyi_bootstrap" ascii
+        $pyi4 = "PYZ-00" ascii
+    condition:
+        uint16(0) == 0x5A4D and 1 of ($pyi*)
+}
+
 /* --- ELF packers --- */
 rule PACKER_UPX_ELF {
     meta: author="builtin" family="packers" target="elf" severity="medium"
@@ -138,6 +151,29 @@ rule PACKER_UPX_ELF {
         uint32(0) == 0x464C457F and 2 of ($u*)
 }
 """
+
+# Паттерны для детекции языка (PyInstaller / Go / Rust), когда DIE вернул None; приоритет .rodata для Go/Rust в language_detector
+LANGUAGE_HINT_PYINSTALLER = (b"pyi-runtime-tmpdir", b"_MEI", b"_pyi_bootstrap", b"PYZ-00")
+LANGUAGE_HINT_GO = (b"runtime.main", b"go.itab.", b"Go build ID", b"go.buildid")
+LANGUAGE_HINT_RUST = (b"_ZN4rust", b"__rust_abi", b".cargo/registry", b"rust_alloc", b"lang_start")
+
+
+def get_language_hint_from_data(data: bytes, max_scan: int = 512 * 1024) -> Optional[str]:
+    """
+    Подсказка языка по сырым строкам (PyInstaller, Go, Rust), если DIE/YARA не вернули язык.
+    Для Go/Rust приоритет отдаётся данным из .rodata (build id) — вызывающий может передать только секцию .rodata.
+    """
+    if not data:
+        return None
+    scan = data[:max_scan] if len(data) > max_scan else data
+    if any(s in scan for s in LANGUAGE_HINT_PYINSTALLER):
+        return "PyInstaller"
+    if any(s in scan for s in LANGUAGE_HINT_GO):
+        return "Go"
+    if any(s in scan for s in LANGUAGE_HINT_RUST):
+        return "Rust"
+    return None
+
 
 # ======== УТИЛИТЫ ========
 def _is_pe(path: Path) -> bool:

@@ -77,6 +77,16 @@ FORTRAN_SIGNATURES = (
 # Perl-to-EXE (PAR/pp): оверлей содержит PAR-архив
 PAR_OVERLAY_SIGNATURES = (b"PAR\x00", b"par-", b"PAR.pm", b"pp.bat", b"perl5lib")
 
+# PyInstaller: runtime tmpdir, _MEIXXXXXX, bootstrap (для детекции языка и YARA)
+PYINSTALLER_SIGNATURES = (
+    b"pyi-runtime-tmpdir",
+    b"_MEI",
+    b"_pyi_bootstrap",
+    b"PyInstaller",
+    b"pyi-",
+    b"PYZ-00",
+)
+
 # Go: runtime, itab, build ID (для test_language_recognition и Evidence.meta.language)
 GO_SIGNATURES = (
     b"runtime.main",
@@ -127,6 +137,8 @@ def detect_from_content(data: bytes, max_scan: int = 512 * 1024) -> Optional[str
         return "D"
     if any(s in scan for s in FORTRAN_SIGNATURES):
         return "Fortran"
+    if any(s in scan for s in PYINSTALLER_SIGNATURES):
+        return "PyInstaller"
     if any(s in scan for s in GO_SIGNATURES):
         return "Go"
     if any(s in scan for s in RUST_SIGNATURES):
@@ -162,8 +174,56 @@ def find_perl_par_in_pe(data: bytes, overlay_start: Optional[int] = None, max_ta
     return any(sig in region for sig in PAR_OVERLAY_SIGNATURES)
 
 
+def _language_from_rodata_like(data: bytes, max_scan: int = 256 * 1024) -> Optional[str]:
+    """
+    Приоритет Go/Rust по строкам (аналог .rodata / build id), когда DIE не вернул язык.
+    Используется только когда infer_language (DIE/YARA) вернул None.
+    """
+    if not data:
+        return None
+    scan = data[:max_scan] if len(data) > max_scan else data
+    if any(s in scan for s in GO_SIGNATURES):
+        return "Go"
+    if any(s in scan for s in RUST_SIGNATURES):
+        return "Rust"
+    return None
+
+
+def _language_from_pe_rodata(path: Path, max_rodata: int = 512 * 1024) -> Optional[str]:
+    """
+    Для Go/Rust приоритет: строки из секции .rodata (build id), если DIE вернул None.
+    Используется в detect_and_route при PE-файле.
+    """
+    try:
+        import pefile  # type: ignore
+        pe = pefile.PE(str(path), fast_load=True)
+    except Exception:
+        return None
+    try:
+        for section in getattr(pe, "sections", []) or []:
+            name = (getattr(section, "Name", b"") or b"").decode("utf-8", errors="ignore").strip("\x00").lower()
+            if name in (".rodata", ".rdata", ".data"):
+                off = section.PointerToRawData
+                size = min(section.SizeOfRawData, max_rodata)
+                if off >= 0 and size > 0:
+                    with path.open("rb") as f:
+                        f.seek(off)
+                        data = f.read(size)
+                    lang = _language_from_rodata_like(data, max_scan=len(data))
+                    if lang:
+                        return lang
+    except Exception:
+        pass
+    finally:
+        try:
+            pe.close()
+        except Exception:
+            pass
+    return None
+
+
 def detect_language_from_file(path: Path, max_bytes: int = 512 * 1024) -> Optional[str]:
-    """Детекция языка по файлу (сигнатуры Nim, Delphi, AutoIt)."""
+    """Детекция языка по файлу (сигнатуры Nim, Delphi, AutoIt, PyInstaller, Go, Rust)."""
     path = Path(path)
     if not path.exists() or not path.is_file():
         return None
@@ -222,6 +282,24 @@ def detect_and_route(
         lang_from_die_yara = infer_language(die_info=die_info, yara_hits=yara_hits)
     except Exception:
         pass
+    # Приоритет Go/Rust: строки из секции .rodata (build id), если DIE не вернул язык
+    if lang_from_die_yara is None and (lang_from_content is None or lang_from_content in ("Go", "Rust")):
+        rodata_lang = None
+        if path.exists():
+            try:
+                rodata_lang = _language_from_pe_rodata(path)
+            except Exception:
+                pass
+        if rodata_lang:
+            lang_from_content = rodata_lang
+        elif data is None and path.exists():
+            try:
+                file_data_for_rodata = path.read_bytes()
+                rodata_lang = _language_from_rodata_like(file_data_for_rodata)
+                if rodata_lang:
+                    lang_from_content = rodata_lang
+            except Exception:
+                pass
     language = lang_from_die_yara or lang_from_content
     options: Dict[str, Any] = {}
     options["scan_autoit_resources"] = should_scan_autoit_resources(language, die_info, yara_hits)

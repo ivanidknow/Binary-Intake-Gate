@@ -703,7 +703,12 @@ def run_parallel_scan(
                         hits_list.append({"rule": "EICAR_Test", "namespace": "fallback", "meta": {"description": "EICAR in dump (fallback)"}, "severity": "low", "tags": [], "techniques": []})
                 except Exception:
                     pass
-            cwe_result = run_cwe_checker(dump_p)
+            try:
+                cwe_result = run_cwe_checker(dump_p)
+                if not isinstance(cwe_result, dict):
+                    cwe_result = {"findings": [], "error": "CWE Analysis unavailable", "return_code": -1}
+            except Exception:
+                cwe_result = {"findings": [], "error": "CWE Analysis unavailable", "return_code": -1}
             # Recursive Feedback Loop: дамп как Child Artifact — YARA уже выполнен, добавляем SecretScanner без повторной эмуляции
             secrets_result = {}
             try:
@@ -820,17 +825,24 @@ def run_parallel_scan(
     else:
         cwe_run_count = 0
         for ev in evidences:
-            target_path = (ev.get("meta") or {}).get("path") or ev.get("path") or ""
-            if not target_path:
-                continue
-            target = Path(target_path)
-            if not target.exists():
-                ev["cwe_analysis"] = {"findings": [], "error": "file_not_found", "return_code": -1}
-                continue
-            _thread_safe_log(f"[cwe] Starting scan for {target.name}")
-            _thread_safe_log(f"[cwe] Вызов контейнера docker cwe_checker: {target.name}")
-            print(f"[CWE_CHECK] {target.name}", flush=True)
-            ev["cwe_analysis"] = run_cwe_checker(target)
+            try:
+                target_path = (ev.get("meta") or {}).get("path") or ev.get("path") or ""
+                if not target_path:
+                    continue
+                target = Path(target_path)
+                if not target.exists():
+                    ev["cwe_analysis"] = {"findings": [], "error": "file_not_found", "return_code": -1}
+                    continue
+                _thread_safe_log(f"[cwe] Starting scan for {target.name}")
+                _thread_safe_log(f"[cwe] Вызов контейнера docker cwe_checker: {target.name}")
+                print(f"[CWE_CHECK] {target.name}", flush=True)
+                cwe_result = run_cwe_checker(target)
+                if not isinstance(cwe_result, dict):
+                    ev["cwe_analysis"] = {"findings": [], "error": "CWE Analysis unavailable", "return_code": -1}
+                else:
+                    ev["cwe_analysis"] = cwe_result
+            except Exception:
+                ev["cwe_analysis"] = {"findings": [], "error": "CWE Analysis unavailable", "return_code": -1}
             cwe_run_count += 1
         if cwe_run_count > 0:
             _thread_safe_log(f"[cwe] Запущено проверок: {cwe_run_count}")

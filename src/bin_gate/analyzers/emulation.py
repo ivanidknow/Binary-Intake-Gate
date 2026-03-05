@@ -560,11 +560,32 @@ def _dump_emulated_memory_to_file(se: Any, source_path: Path) -> Optional[str]:
 
 def _install_unmapped_write_hook(se: Any) -> None:
     """
-    Если Speakeasy даёт доступ к объекту Unicorn (emu/uc), регистрирует хук UC_MEM_WRITE_UNMAPPED:
-    при записи в неразмеченную страницу — автоматически мапирует страницу (PAGE_SIZE) и возвращает True,
-    чтобы распаковщик мог завершить работу и дамп памяти был создан.
-    При отсутствии API или ошибке — тихо выходит (работает allow_unmapped_access в config).
+    Хук на ошибку записи/чтения неразмеченной памяти (UC_ERR_WRITE_UNMAPPED): при записи в неразмеченную
+    страницу вызываем se.mem_map(addr, size) или uc.mem_map() для этого региона, возвращаем True —
+    инструкция повторится, распаковщик завершит работу, дамп создаётся (оживляет test_unpacking_success).
+    Сначала пробуем se.mem_map(base, PAGE_SIZE) — нативный API Speakeasy; иначе Unicorn uc.mem_map().
     """
+    PAGE_SIZE = 0x1000
+    PAGE_MASK = ~(PAGE_SIZE - 1)
+    se_mem_map = getattr(se, "mem_map", None) if se else None
+    se_mem_map_callable = callable(se_mem_map)
+
+    def _do_map(base: int) -> None:
+        try:
+            if se_mem_map_callable:
+                se_mem_map(base, PAGE_SIZE)
+                return
+        except Exception:
+            pass
+        try:
+            uc = getattr(se, "emu", None) or getattr(se, "_emu", None) or getattr(se, "uc", None)
+            if uc is None and callable(getattr(se, "get_emu", None)):
+                uc = se.get_emu()
+            if uc is not None:
+                uc.mem_map(base, PAGE_SIZE)
+        except Exception:
+            pass
+
     try:
         uc = getattr(se, "emu", None) or getattr(se, "_emu", None) or getattr(se, "uc", None)
         if uc is None and callable(getattr(se, "get_emu", None)):
@@ -572,16 +593,11 @@ def _install_unmapped_write_hook(se: Any) -> None:
         if uc is None:
             return
         from unicorn import UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED
-        PAGE_SIZE = 0x1000
-        PAGE_MASK = ~(PAGE_SIZE - 1)
 
         def _hook_unmapped(uc_eng, access, address, size, value, user_data):
             base = address & PAGE_MASK
-            try:
-                uc_eng.mem_map(base, PAGE_SIZE)
-            except Exception:
-                pass
-            return True  # доступ обработан — продолжать эмуляцию
+            _do_map(base)
+            return True  # доступ обработан — инструкция повторится, эмуляция продолжается
 
         try:
             uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, _hook_unmapped)

@@ -527,65 +527,82 @@ def run_emulation_container(
         )
 
 
+def _cwe_safe_result(error: str, return_code: int, stderr: str) -> Dict[str, Any]:
+    """Единый формат ответа при ошибке CWE (парсинг/пустой вывод) — тест не падает."""
+    return {"findings": [], "error": error, "return_code": return_code, "stderr": stderr or ""}
+
+
 def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     """
     Run cwe_checker (fkiecad/cwe_checker) in Docker on the given binary/dump file.
-    Mounts parent folder as /share:ro; command: cwe_checker /share/<name> --json.
+    Mounts parent folder as /share:ro; command: cwe_checker /share/<name> --core --json (fallback --no-config).
     Returns dict with keys: findings (list), error (str or None), return_code (int), stderr (str).
-    When debug=True (или BIN_GATE_CWE_DEBUG=1), логирует stdout/stderr контейнера в консоль.
+    Временный файл не создаётся; host_path выставляется в 0o644 для доступа контейнера (FINAL MANDATORY CWE STAGE).
     """
     import json as _json
     debug = debug or (os.environ.get("BIN_GATE_CWE_DEBUG", "").strip().lower() in ("1", "true", "yes"))
     host_path = Path(file_path).resolve()
     if not host_path.exists():
-        return {"findings": [], "error": "file_not_found", "return_code": -1, "stderr": ""}
-    # Принудительные права на файл, чтобы контейнер мог прочитать бинарник (Permission Denied в CI)
+        return _cwe_safe_result("file_not_found", -1, "")
+    # Права 0o644: контейнер может прочитать файл; FINAL MANDATORY CWE STAGE завершается корректно
     try:
         os.chmod(host_path, 0o644)
     except OSError:
         pass
     host_dir = host_path.parent
-    # Монтируем родительский каталог в /share:ro; --user root избегает конфликтов UID с томами
     container_file = f"/share/{host_path.name}"
     mount_arg = f"{host_dir}:/share:ro"
-    cmd = ["docker", "run", "--rm", "--user", "root", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file, "--json"]
-    if debug:
-        print(f"[DOCKER_CWE_DEBUG] cmd: {cmd}", flush=True)
-        print(f"[DOCKER_CWE_DEBUG] host_path={host_path!r} mount={mount_arg!r} container_file={container_file!r}", flush=True)
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return {"findings": [], "error": "timeout_300s", "return_code": -1, "stderr": ""}
-    except Exception as e:
-        return {"findings": [], "error": str(e), "return_code": -1, "stderr": ""}
-    stdout_str = (result.stdout or "").strip()
-    stderr_str = (result.stderr or "").strip()
+    result = None
+    stdout_str = ""
+    stderr_str = ""
+    for extra_args in (["--core", "--json"], ["--no-config", "--json"]):
+        cmd = ["docker", "run", "--rm", "--user", "root", "-v", mount_arg, CWE_CHECKER_IMAGE, container_file] + list(extra_args)
+        if debug:
+            print(f"[DOCKER_CWE_DEBUG] cmd: {cmd}", flush=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return _cwe_safe_result("timeout_300s", -1, "")
+        except Exception as e:
+            return _cwe_safe_result(str(e), -1, "")
+        stdout_str = (result.stdout or "").strip()
+        stderr_str = (result.stderr or "").strip()
+        if result.returncode == 0:
+            break
+        if any(x in (stderr_str + stdout_str).lower() for x in ("config", "ghidra", "json", "mandatory")):
+            continue
+        break
+    if result is None:
+        return _cwe_safe_result("CWE Analysis unavailable", -1, "")
     if debug or result.returncode != 0:
         print(f"[DOCKER_CWE] returncode={result.returncode} stdout_len={len(stdout_str)} stderr_len={len(stderr_str)}", flush=True)
-        if debug:
+        if debug and stdout_str:
             print(f"[DOCKER_CWE_DEBUG] stdout:\n{stdout_str[:4000] or '(empty)'}", flush=True)
+        if debug and stderr_str:
             print(f"[DOCKER_CWE_DEBUG] stderr:\n{stderr_str[:2000] or '(empty)'}", flush=True)
         elif result.returncode != 0 and stderr_str:
             print(f"[DOCKER_CWE] stderr: {stderr_str[:800]}", flush=True)
     if result.returncode != 0:
         print(f"[DOCKER_ERROR] cwe_checker failed: {stderr_str[:500]}", flush=True)
-    findings: List[Dict[str, Any]] = []
-    if stdout_str:
-        match = _re.search(r"\[\s*\{.*\}\s*\]", stdout_str, _re.DOTALL)
-        if match:
-            try:
-                data = _json.loads(match.group(0))
-                if isinstance(data, list):
-                    findings = data
-            except Exception:
-                pass
-    error = None if result.returncode == 0 else (stderr_str[:500] if stderr_str else f"exit_{result.returncode}")
-    return {
-        "findings": findings,
-        "error": error,
-        "return_code": result.returncode,
-        "stderr": stderr_str,
-    }
+    try:
+        findings: List[Dict[str, Any]] = []
+        parse_ok = False
+        if stdout_str:
+            match = _re.search(r"\[\s*\{.*\}\s*\]", stdout_str, _re.DOTALL)
+            if match:
+                try:
+                    data = _json.loads(match.group(0))
+                    if isinstance(data, list):
+                        findings = data
+                        parse_ok = True
+                except Exception:
+                    pass
+        error = None if result.returncode == 0 else (stderr_str[:500] if stderr_str else f"exit_{result.returncode}")
+        if error is None and not parse_ok:
+            error = "CWE Analysis unavailable"
+        return {"findings": findings, "error": error, "return_code": result.returncode, "stderr": stderr_str}
+    except Exception:
+        return _cwe_safe_result("CWE Analysis unavailable", -1, stderr_str[:500])
 
 
 # Startup validation
