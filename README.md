@@ -44,7 +44,7 @@
 | **Эмуляция (опционально)** | Запуск PE в Speakeasy, дамп памяти, YARA/CVE по дампу | speakeasy-emulator или Docker-образ `bin-gate-emulation` |
 | **Отчёты** | Краткий MD, человекочитаемый (RU) с обоснованием вердикта, HVCI/WDAC, секреты, CWE, SARIF | `reporters/` |
 
-Docker используется для DIE, Syft, Grype, CWE checker и Gitleaks; при недоступности демона сканирование завершается с ошибкой (Hard Fail). Локальная эмуляция и capa опциональны.
+Docker используется для DIE, Syft, Grype, CWE checker и Gitleaks; при недоступности демона сканирование завершается с ошибкой (Hard Fail). Локальная эмуляция и capa опциональны. **Перед первым запуском тестов с CWE** выполните `docker pull fkiecad/cwe_checker:latest` (или `make docker-pull-cwe`), чтобы не ждать загрузки образа при первом сканировании.
 
 ---
 

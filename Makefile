@@ -1,5 +1,5 @@
 # Binary Intake Gate — сборка и тесты
-.PHONY: test test-security clean clean-artifacts artifacts
+.PHONY: test test-security clean clean-artifacts artifacts docker-pull-cwe
 
 # Директория тестовых артефактов (генерируется и удаляется при test-security)
 TEST_ARTIFACTS_DIR ?= tests/artifacts
@@ -7,8 +7,12 @@ TEST_ARTIFACTS_DIR ?= tests/artifacts
 test:
 	pytest tests/ -v --tb=short -x
 
+# Скачать образ CWE checker до тестов, чтобы не ждать 3+ мин при первом запуске
+docker-pull-cwe:
+	docker pull fkiecad/cwe_checker:latest
+
 # Запуск security/methodology тестов (семплы генерируются во временной директории pytest)
-test-security:
+test-security: docker-pull-cwe
 	pytest tests/test_methodology.py -v --tb=short
 	$(MAKE) clean-artifacts
 

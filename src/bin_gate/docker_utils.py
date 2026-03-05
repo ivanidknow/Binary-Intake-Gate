@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import subprocess
 import os
+import re as _re
+import stat
 import sys
 
 # Volume names for caching
@@ -538,6 +540,11 @@ def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     host_path = Path(file_path).resolve()
     if not host_path.exists():
         return {"findings": [], "error": "file_not_found", "return_code": -1, "stderr": ""}
+    # Чтобы контейнер мог прочитать файл (Permission Denied в CI/Docker)
+    try:
+        os.chmod(host_path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    except OSError:
+        pass
     host_dir = host_path.parent
     # Монтируем родительский каталог в /share:ro, чтобы контейнер видел файл как /share/<name>
     container_file = f"/share/{host_path.name}"
@@ -564,14 +571,15 @@ def run_cwe_checker(file_path: Path, debug: bool = False) -> Dict[str, Any]:
     if result.returncode != 0:
         print(f"[DOCKER_ERROR] cwe_checker failed: {stderr_str[:500]}", flush=True)
     findings: List[Dict[str, Any]] = []
-    match = _re.search(r"\[\s*\{.*\}\s*\]", result.stdout or "", _re.DOTALL)
-    if match:
-        try:
-            data = _json.loads(match.group(0))
-            if isinstance(data, list):
-                findings = data
-        except Exception:
-            pass
+    if stdout_str:
+        match = _re.search(r"\[\s*\{.*\}\s*\]", stdout_str, _re.DOTALL)
+        if match:
+            try:
+                data = _json.loads(match.group(0))
+                if isinstance(data, list):
+                    findings = data
+            except Exception:
+                pass
     error = None if result.returncode == 0 else (stderr_str[:500] if stderr_str else f"exit_{result.returncode}")
     return {
         "findings": findings,
