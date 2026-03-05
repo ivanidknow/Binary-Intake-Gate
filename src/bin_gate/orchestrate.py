@@ -274,6 +274,19 @@ def run_parallel_scan(
         pass
     else:
         options = _build_options(args)
+        # Предупреждение, если субмодуль capa-rules пуст — продолжаем с базовыми правилами
+        capa_rules = options.get("capa_rules")
+        if capa_rules:
+            capa_path = Path(capa_rules)
+            if capa_path.exists() and capa_path.is_dir():
+                try:
+                    if not any(capa_path.iterdir()):
+                        _msg = "[SCA] Субмодуль capa-rules пуст (git submodule update --init capa-rules?). Продолжаем с базовыми правилами."
+                        _thread_safe_log(_msg)
+                        if cli_dbg:
+                            cli_dbg(_msg)
+                except OSError:
+                    pass
         # pre_analysis_dispatch: если DIE/сигнатура определила UPX — распаковать перед YARA
         unpacked_for_yara: Dict[str, Optional[str]] = {}
         try:

@@ -584,8 +584,15 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
     start_time = time.time()
     
     try:
-        # Initialize Speakeasy
-        se = Speakeasy()
+        # Initialize Speakeasy: более агрессивный маппинг памяти для распаковки (снижает UC_ERR_WRITE_UNMAPPED)
+        config = {
+            "keep_memory_on_free": True,
+            "memory_tracing": False,
+        }
+        try:
+            se = Speakeasy(config=config)
+        except TypeError:
+            se = Speakeasy()
         
         # Load the module (критический сбой загрузчика UC_ERR_WRITE_UNMAPPED и др. — не роняем весь процесс)
         try:
