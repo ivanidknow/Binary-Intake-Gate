@@ -1403,14 +1403,13 @@ def test_unpacking_success(built_artifacts, request):
         pytest.fail("run_parallel_scan did not return evidence for sample_packed_t1055")
 
     emu = ev.get("emulation")
-    if not emu or not isinstance(emu, dict):
-        err = (emu.get("error") if isinstance(emu, dict) else None) or "emulation block missing"
-        pytest.skip(f"Emulation did not run (container/tooling): {err}")
-
+    assert emu and isinstance(emu, dict), (
+        f"Emulation must run for packed sample: {(emu.get('error') if isinstance(emu, dict) else None) or 'emulation block missing'}"
+    )
     dump_path = emu.get("memory_dump_path")
-    if not dump_path or not Path(dump_path).exists():
-        err = (emu.get("error") or "").strip()
-        pytest.skip(f"Emulation did not produce a memory dump: {err}")
+    assert dump_path and Path(dump_path).exists(), (
+        f"Emulation must produce a memory dump: {(emu.get('error') or '').strip()}"
+    )
 
     # Decrypted payload (T1055 injection APIs) must appear in memory after stub runs
     T1055_MARKERS = (b"CreateRemoteThread", b"VirtualAllocEx", b"WriteProcessMemory", b"OpenProcess")
@@ -1436,14 +1435,18 @@ def test_language_recognition(built_artifacts):
     Rust / Go / PyInstaller artifacts: language is written to ev["meta"]["language"].
     Preferred: Rust/Go/PyInstaller; DIE may report generic compiler (GCC/C/C++) for minimal PE — accept that too.
     """
-    # (artifact_key, preferred language values; generic compiler accepted if DIE only sees PE)
     expectations = [
         ("rust_sample", ("Rust", "rust")),
         ("pyinstaller_sample", ("PyInstaller", "Python", "pyinstaller")),
         ("go_sample_obfuscated", ("Go", "golang", "go")),
     ]
+    has_any = any(
+        built_artifacts.get(key) and Path(built_artifacts.get(key)).exists()
+        for key, _ in expectations
+    )
+    if not has_any:
+        pytest.skip("rust_sample / pyinstaller_sample / go_sample_obfuscated not built")
     generic = ("c/c++", "gcc", "msvc", "visual c", "mingw", "clang", "borland")
-    any_checked = False
     for key, allowed in expectations:
         path = built_artifacts.get(key)
         if not path or not Path(path).exists():
@@ -1451,8 +1454,9 @@ def test_language_recognition(built_artifacts):
         ev = _run_analysis(path)
         meta = ev.get("meta") or {}
         lang = meta.get("language")
-        if lang is None:
-            continue
+        assert lang is not None, (
+            f"Artifact {key}: ev['meta']['language'] must be set (DIE/YARA or language_detector strings)"
+        )
         lang_lower = (lang or "").strip().lower()
         allowed_lower = [a.strip().lower() for a in allowed]
         ok = any(l in lang_lower or lang_lower in l for l in allowed_lower)
@@ -1460,9 +1464,6 @@ def test_language_recognition(built_artifacts):
         assert ok, (
             f"Artifact {key}: expected language in {allowed} or generic compiler, got '{lang}'"
         )
-        any_checked = True
-    if not any_checked:
-        pytest.skip("No language set for rust/pyinstaller/go artifacts (DIE/YARA may be unavailable or not matching)")
 
 
 def test_advanced_stack_recognition(built_artifacts, request):
@@ -1797,10 +1798,8 @@ def test_external_rules_loading():
         )
     except ImportError as e:
         pytest.skip(f"yara_scan not available: {e}")
-    # Основные правила (builtin или rules_dir) — должны загрузиться при установленном yara
+    # Основные правила (builtin или rules_dir) — должны загрузиться при установленном yara (.[test] включает yara-python)
     main_rules, main_errs = _load_or_compile_rules(None, use_builtin=True)
-    if main_rules is None and main_errs and any("yara_not_installed" in str(e) for e in main_errs):
-        pytest.skip("yara-python not installed — skip external rules test")
     assert main_rules is not None, f"Main rules should load (builtin). Errors: {main_errs}"
     # Внешние базы (могут быть пустыми, если --sync не запускали)
     ext_list, ext_errs = _load_external_rules()

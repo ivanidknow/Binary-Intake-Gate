@@ -77,6 +77,29 @@ FORTRAN_SIGNATURES = (
 # Perl-to-EXE (PAR/pp): оверлей содержит PAR-архив
 PAR_OVERLAY_SIGNATURES = (b"PAR\x00", b"par-", b"PAR.pm", b"pp.bat", b"perl5lib")
 
+# Go: runtime, itab, build ID (для test_language_recognition и Evidence.meta.language)
+GO_SIGNATURES = (
+    b"runtime.main",
+    b"go.itab.",
+    b"Go build ID",
+    b"runtime.morestack",
+    b"go.string.",
+    b"go.func.",
+    b"runtime.",
+    b"go.buildid",
+    b"type..importpath",
+)
+# Rust: mangled symbols, ABI, cargo paths (без общих core::/std:: чтобы не путать с C++)
+RUST_SIGNATURES = (
+    b"_ZN4rust",
+    b"__rust_abi",
+    b".cargo/registry",
+    b"rust_alloc",
+    b"rust_eh_personality",
+    b"__rust_",
+    b"lang_start",
+)
+
 
 def detect_from_content(data: bytes, max_scan: int = 512 * 1024) -> Optional[str]:
     """
@@ -104,6 +127,10 @@ def detect_from_content(data: bytes, max_scan: int = 512 * 1024) -> Optional[str
         return "D"
     if any(s in scan for s in FORTRAN_SIGNATURES):
         return "Fortran"
+    if any(s in scan for s in GO_SIGNATURES):
+        return "Go"
+    if any(s in scan for s in RUST_SIGNATURES):
+        return "Rust"
     return None
 
 

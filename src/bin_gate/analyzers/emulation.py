@@ -558,6 +558,43 @@ def _dump_emulated_memory_to_file(se: Any, source_path: Path) -> Optional[str]:
     return None
 
 
+def _install_unmapped_write_hook(se: Any) -> None:
+    """
+    Если Speakeasy даёт доступ к объекту Unicorn (emu/uc), регистрирует хук UC_MEM_WRITE_UNMAPPED:
+    при записи в неразмеченную страницу — автоматически мапирует страницу (PAGE_SIZE) и возвращает True,
+    чтобы распаковщик мог завершить работу и дамп памяти был создан.
+    При отсутствии API или ошибке — тихо выходит (работает allow_unmapped_access в config).
+    """
+    try:
+        uc = getattr(se, "emu", None) or getattr(se, "_emu", None) or getattr(se, "uc", None)
+        if uc is None and callable(getattr(se, "get_emu", None)):
+            uc = se.get_emu()
+        if uc is None:
+            return
+        from unicorn import UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED
+        PAGE_SIZE = 0x1000
+        PAGE_MASK = ~(PAGE_SIZE - 1)
+
+        def _hook_unmapped(uc_eng, access, address, size, value, user_data):
+            base = address & PAGE_MASK
+            try:
+                uc_eng.mem_map(base, PAGE_SIZE)
+            except Exception:
+                pass
+            return True  # доступ обработан — продолжать эмуляцию
+
+        try:
+            uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, _hook_unmapped)
+        except Exception:
+            pass
+        try:
+            uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED, _hook_unmapped)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
     """
     Run Speakeasy emulation on a PE file.
@@ -584,15 +621,21 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
     start_time = time.time()
     
     try:
-        # Initialize Speakeasy: более агрессивный маппинг памяти для распаковки (снижает UC_ERR_WRITE_UNMAPPED)
+        # Initialize Speakeasy: снижение UC_ERR_WRITE_UNMAPPED при распаковке (запись в динамически выделенную память)
         config = {
             "keep_memory_on_free": True,
             "memory_tracing": False,
+            "allow_unmapped_access": True,  # при записи в неразмеченную область — не падать; эмулятор может промапить страницу
         }
         try:
             se = Speakeasy(config=config)
         except TypeError:
-            se = Speakeasy()
+            # Старые версии Speakeasy не принимают allow_unmapped_access
+            config_legacy = {k: v for k, v in config.items() if k != "allow_unmapped_access"}
+            try:
+                se = Speakeasy(config=config_legacy)
+            except TypeError:
+                se = Speakeasy()
         
         # Load the module (критический сбой загрузчика UC_ERR_WRITE_UNMAPPED и др. — не роняем весь процесс)
         try:
@@ -602,6 +645,9 @@ def _run_speakeasy_emulation(path: Path, timeout: int) -> EmulationResult:
             result.error = f"load_failed:{str(load_err)[:300]}"
             result.elapsed_ms = int((time.time() - start_time) * 1000)
             return result
+        
+        # После load_module: хук UC_MEM_WRITE_UNMAPPED + авто-мапирование страницы (если Speakeasy даёт доступ к Unicorn)
+        _install_unmapped_write_hook(se)
         
         # Set up hooks for interesting APIs
         api_calls = []
